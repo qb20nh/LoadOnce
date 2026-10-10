@@ -22,6 +22,8 @@ A native executable starts a small Java supervisor, which launches the selected 
 
 Build on the target platform with a C compiler: GCC on Linux, or CMake and MSVC on Windows. The Windows redirector requires Windows 10 version 1703 or newer for atomic child-job assignment.
 
+Windows executables link the C runtime statically; the private runtime directory needs no separate Visual C++ runtime DLL.
+
 ```sh
 ./gradlew redirectorDistribution redirectorSmoke supervisorAotSmoke
 ```

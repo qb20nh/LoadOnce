@@ -8,6 +8,8 @@ endif()
 function(loadonce_redirector target)
     target_compile_features(${target} PRIVATE c_std_11)
     if(MSVC)
+        # The private executable cannot rely on DLLs beside the backend JDK.
+        set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         target_compile_options(${target} PRIVATE /W4 /WX /utf-8)
         target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     else()

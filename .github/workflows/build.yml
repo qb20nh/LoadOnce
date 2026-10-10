@@ -56,6 +56,20 @@ jobs:
           distribution: 'microsoft'
       - name: Windows java and javaw forwarding
         run: .\gradlew.bat --no-daemon --continue agentContractTest agentAotSmoke redirectorSmoke supervisorAotSmoke redirectorDistribution
+      - name: verify standalone Windows executable dependencies
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (!$dumpbin) { throw 'MSVC dependency inspector unavailable' }
+          foreach ($name in 'java.exe', 'javaw.exe') {
+            $imports = & $dumpbin /NOLOGO /DEPENDENTS "build/native-redirectors/$name"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $name dependencies" }
+            if ($imports -match '(?i)(VCRUNTIME|MSVCP|API-MS-WIN-CRT-|UCRTBASE)') {
+              throw "$name requires an unbundled Visual C++ runtime"
+            }
+            $imports
+          }
       - name: capture Windows redirector distribution
         uses: actions/upload-artifact@v7
         with:
