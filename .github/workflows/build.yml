@@ -55,7 +55,7 @@ jobs:
           java-version: '25'
           distribution: 'microsoft'
       - name: Windows java and javaw forwarding
-        run: .\gradlew.bat --no-daemon agentContractTest agentAotSmoke redirectorSmoke redirectorDistribution
+        run: .\gradlew.bat --no-daemon --continue agentContractTest agentAotSmoke redirectorSmoke redirectorDistribution
       - name: capture Windows redirector distribution
         uses: actions/upload-artifact@v7
         with:

@@ -24,4 +24,7 @@ if(WIN32)
     add_executable(javaw WIN32 redirector.c)
     target_compile_definitions(javaw PRIVATE LOADONCE_GUI=1)
     loadonce_redirector(javaw)
+    # Test-only Unicode boundary witness; distributions contain only java/javaw.
+    add_executable(wide-argument-witness wide_argument_witness.c)
+    loadonce_redirector(wide-argument-witness)
 endif()

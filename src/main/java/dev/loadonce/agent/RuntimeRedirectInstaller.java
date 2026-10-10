@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -96,6 +97,21 @@ public final class RuntimeRedirectInstaller {
         String backendValue = configValue(backend);
         String agentValue = configValue(output.resolve("loadonce-agent.jar"));
         if (agentValue.indexOf('=') >= 0) throw new IOException("Private runtime path cannot contain the Java agent option separator");
+        if (windows) {
+            String nativeEncoding = System.getProperty("native.encoding");
+            Charset nativeCharset;
+            try {
+                if (nativeEncoding == null) throw new IllegalArgumentException();
+                nativeCharset = Charset.forName(nativeEncoding);
+            } catch (IllegalArgumentException unavailable) {
+                throw new IOException("Windows native.encoding is unavailable; cannot validate the installed agent path");
+            }
+            if (!nativeCharset.newEncoder().canEncode(agentValue)
+                    || !nativeCharset.decode(nativeCharset.encode(agentValue)).toString().equals(agentValue)) {
+                throw new IOException("Installed agent path cannot be preserved by Windows native.encoding ("
+                        + nativeEncoding + "); choose a path using supported characters");
+            }
+        }
         boolean posix = Files.getFileStore(parent).supportsFileAttributeView("posix");
         FileAttribute<?>[] permissions = posix
                 ? new FileAttribute<?>[] {PosixFilePermissions.asFileAttribute(PRIVATE_DIRECTORY)} : new FileAttribute<?>[0];

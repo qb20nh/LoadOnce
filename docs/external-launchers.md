@@ -36,6 +36,8 @@ java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInst
 
 This command runs setup once. Normal game launches use the native executable directly. The installer copies the agent and forwarding binaries, writes their absolute paths into `bin/loadonce-runtime.conf`, and retains the selected backend JDK. It requires a new output directory and refuses to install inside that JDK. Do not move an installed redirector directory; rerun setup into a new location if paths change. Installation neither replaces system Java nor edits the original runtime.
 
+On Windows, run setup with the selected backend JDK. The installer rejects an agent path that this JVM's `native.encoding` cannot represent. The redirector forwards Unicode through the Windows wide-character API, but the selected Java launcher may convert arguments through the host's ANSI code page. Characters unavailable in that code page can become `?` in application arguments even with direct Java. Use paths and arguments supported by that runtime's native encoding; the redirector does not change it.
+
 On Windows, build with `.\gradlew.bat` and use a single-line PowerShell setup command, substituting your actual JDK and output paths:
 
 ```powershell

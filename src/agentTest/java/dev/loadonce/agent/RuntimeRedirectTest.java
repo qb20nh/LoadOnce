@@ -5,12 +5,14 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,6 +40,10 @@ public final class RuntimeRedirectTest {
     public static void main(String[] arguments) throws Exception {
         Options options = Options.parse(arguments);
         try (Fixture fixture = new Fixture(options)) {
+            if (WINDOWS) {
+                fixture.windowsWideArguments(options);
+                fixture.windowsAgentPathFailures(options);
+            }
             for (String name : WINDOWS ? List.of("java.exe", "javaw.exe") : List.of("java")) {
                 Path redirector = fixture.output.resolve("bin").resolve(name);
                 check(Files.isRegularFile(redirector), "installed redirector is missing");
@@ -73,12 +79,14 @@ public final class RuntimeRedirectTest {
         boolean closed;
 
         Fixture(Options options) throws Exception {
-            root = Files.createTempDirectory("loadonce redirect π ").toAbsolutePath();
-            output = root.resolve("selected runtime 한글");
+            // Windows JDK launchers can narrow argv through the ANSI code page. Keep their
+            // required file paths representable; test full Unicode at the native boundary below.
+            root = Files.createTempDirectory(WINDOWS ? "loadonce redirect " : "loadonce redirect π ").toAbsolutePath();
+            output = root.resolve(WINDOWS ? "selected runtime" : "selected runtime 한글");
             javaHome = options.javaHome().toRealPath();
             backend = javaHome.resolve("bin").resolve(WINDOWS ? "java.exe" : "java").toRealPath();
-            cwd = Files.createDirectory(root.resolve("working directory π"));
-            checkerJar = root.resolve("checker fixture π.jar");
+            cwd = Files.createDirectory(root.resolve(WINDOWS ? "working directory" : "working directory π"));
+            checkerJar = root.resolve(WINDOWS ? "checker fixture.jar" : "checker fixture π.jar");
             shutdown = new Thread(this::stopAll, "loadonce-redirect-contract-cleanup");
             try {
                 RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), output, options.agentJar());
@@ -97,13 +105,26 @@ public final class RuntimeRedirectTest {
         }
 
         void exactInvocation(Path redirector, boolean jar, int exit) throws Exception {
+            WitnessRecord direct = null;
+            if (WINDOWS) {
+                Invocation baseline = invocation(javaHome.resolve("bin").resolve(redirector.getFileName()).toRealPath(), jar, exit, 0);
+                List<String> command = new ArrayList<>(baseline.command());
+                command.add(1, "-javaagent:" + agent);
+                Result expected = run(command, Duration.ofSeconds(30), STDIN.getBytes(StandardCharsets.UTF_8));
+                equal(exit, expected.exitCode(), "direct JDK baseline failed");
+                direct = readRecord(baseline.record());
+                equal(List.of(Long.toString(direct.pid())), Files.readAllLines(baseline.starts()), "direct JDK baseline replayed main");
+                check(!alive(direct.pid()), "direct JDK baseline remained alive after exit");
+            }
             Invocation invocation = invocation(redirector, jar, exit, 0);
             Result result = run(invocation.command(), Duration.ofSeconds(30), STDIN.getBytes(StandardCharsets.UTF_8));
             equal(exit, result.exitCode(), "application exit status changed");
             WitnessRecord record = readRecord(invocation.record());
             remember(record.pid());
-            equal(ARGUMENTS, record.arguments(), "application argv changed");
-            equal(VM_VALUE, record.vmProperty(), "JVM option value changed");
+            // The wide native witness separately requires the original Unicode vector. This
+            // comparison isolates the actual JDK's platform decoding from redirector changes.
+            equal(WINDOWS ? direct.arguments() : ARGUMENTS, record.arguments(), "application argv changed");
+            equal(WINDOWS ? direct.vmProperty() : VM_VALUE, record.vmProperty(), "JVM option value changed");
             equal(javaHome, Path.of(record.javaHome()).toRealPath(), "redirector changed the selected JDK");
             equal(cwd.toRealPath(), Path.of(record.cwd()).toRealPath(), "redirector changed the working directory");
             equal(environment.get("LOADONCE_REDIRECT_TEST_MARKER"), record.marker(), "redirector changed the explicit environment");
@@ -117,6 +138,73 @@ public final class RuntimeRedirectTest {
             assertIdentity(result.pid(), record);
             equal(List.of(Long.toString(record.pid())), Files.readAllLines(invocation.starts()), "application main replayed");
             check(!alive(record.pid()), "application remained alive after its reported exit");
+        }
+
+        void windowsWideArguments(Options options) throws Exception {
+            Path witness = options.redirectorsDirectory().resolve("wide-argument-witness.exe").toRealPath();
+            Path home = Files.createDirectory(root.resolve("native backend 한글 π 🧪"));
+            Path bin = Files.createDirectory(home.resolve("bin"));
+            for (String name : List.of("java.exe", "javaw.exe")) Files.copy(witness, bin.resolve(name));
+            Path selected = RuntimeRedirectInstaller.install(home, options.redirectorsDirectory(),
+                    root.resolve("native wide runtime"), options.agentJar());
+            Path working = Files.createDirectory(root.resolve("native working directory 한글 π 🧪"));
+            String agentOption = "-javaagent:" + selected.resolve("loadonce-agent.jar").toRealPath();
+            for (String name : List.of("java.exe", "javaw.exe")) {
+                Path record = working.resolve(name + " record 한글 π 🧪.txt");
+                List<String> expected = new ArrayList<>(List.of(agentOption, "--record", record.toString(),
+                        "-Dloadonce.redirect.test.option=" + VM_VALUE));
+                expected.addAll(ARGUMENTS);
+                List<String> direct = new ArrayList<>(List.of(bin.resolve(name).toString()));
+                direct.addAll(expected);
+                Result baseline = run(direct, Duration.ofSeconds(20), new byte[0], working);
+                equal(0, baseline.exitCode(), "direct wide-argument witness failed");
+                equal(expected, readWideRecord(record), "test transport changed the original wide argument vector");
+                Files.delete(record);
+                List<String> redirected = new ArrayList<>(List.of(selected.resolve("bin").resolve(name).toString()));
+                redirected.addAll(expected.subList(1, expected.size()));
+                Result actual = run(redirected, Duration.ofSeconds(20), new byte[0], working);
+                equal(0, actual.exitCode(), "redirected wide-argument witness failed");
+                equal(expected, readWideRecord(record), "native redirector changed the original wide argument vector");
+                equal(baseline.stdout(), actual.stdout(), "native witness stdout changed");
+                equal(baseline.stderr(), actual.stderr(), "native witness stderr changed");
+            }
+        }
+
+        void windowsAgentPathFailures(Options options) throws Exception {
+            String encoding = System.getProperty("native.encoding");
+            Charset charset = Charset.forName(encoding);
+            String unsupported = null;
+            for (String value : List.of("한글", "π", "🧪", "漢字", "Ж", "₹")) {
+                if (!charset.newEncoder().canEncode(value)) {
+                    unsupported = value;
+                    break;
+                }
+            }
+            if (unsupported != null) {
+                rejectsAgentPath(options, root.resolve("unsupported agent path " + unsupported));
+            } else {
+                System.out.println("Windows native.encoding=" + encoding + " represents all Unicode path fixtures");
+            }
+            try {
+                System.setProperty("native.encoding", "MS932");
+                // MS932 can encode yen, but decoding its bytes produces backslash instead.
+                check(Charset.forName("MS932").newEncoder().canEncode("¥"), "MS932 alias fixture is not encodable");
+                rejectsAgentPath(options, root.resolve("agent path yen ¥"));
+            } finally {
+                if (encoding == null) System.clearProperty("native.encoding");
+                else System.setProperty("native.encoding", encoding);
+            }
+        }
+
+        void rejectsAgentPath(Options options, Path rejected) throws Exception {
+            try {
+                RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), rejected, options.agentJar());
+                throw new AssertionError("installer accepted an agent path the Windows JDK cannot preserve");
+            } catch (IOException expected) {
+                check(expected.getMessage().contains("cannot be preserved by Windows native.encoding"),
+                        "unsupported agent path failed for an unrelated reason");
+            }
+            check(!Files.exists(rejected), "installer published an unsupported agent path");
         }
 
         void probes(Path redirector) throws Exception {
@@ -220,10 +308,14 @@ public final class RuntimeRedirectTest {
         }
 
         synchronized Running start(List<String> command, byte[] stdin) throws IOException {
+            return start(command, stdin, cwd);
+        }
+
+        synchronized Running start(List<String> command, byte[] stdin, Path workingDirectory) throws IOException {
             if (closed) throw new IOException("redirect fixture is closed");
             Path log = Files.createTempFile(root, "child-", ".log");
             Path error = Files.createTempFile(root, "child-stderr-", ".log");
-            ProcessBuilder builder = new ProcessBuilder(command).directory(cwd.toFile())
+            ProcessBuilder builder = new ProcessBuilder(WindowsCommandLine.forProcessBuilder(command)).directory(workingDirectory.toFile())
                     .redirectOutput(log.toFile()).redirectError(error.toFile());
             builder.environment().clear();
             builder.environment().putAll(environment);
@@ -241,7 +333,11 @@ public final class RuntimeRedirectTest {
         }
 
         Result run(List<String> command, Duration timeout, byte[] stdin) throws Exception {
-            Running running = start(command, stdin);
+            return run(command, timeout, stdin, cwd);
+        }
+
+        Result run(List<String> command, Duration timeout, byte[] stdin, Path workingDirectory) throws Exception {
+            Running running = start(command, stdin, workingDirectory);
             long started = System.nanoTime();
             while (running.process().isAlive()) {
                 sample();
@@ -304,7 +400,7 @@ public final class RuntimeRedirectTest {
             if (interrupted) Thread.currentThread().interrupt();
         }
 
-        @Override public void close() throws Exception {
+        @Override public void close() throws IOException {
             stopAll();
             try {
                 Runtime.getRuntime().removeShutdownHook(shutdown);
@@ -340,6 +436,24 @@ public final class RuntimeRedirectTest {
         List<String> values = new ArrayList<>();
         for (int index = 0; index < size; index++) values.add(input.readUTF());
         return List.copyOf(values);
+    }
+
+    private static List<String> readWideRecord(Path path) throws IOException {
+        if (Files.size(path) > 64 * 1024) throw new IOException("wide argument witness exceeded its record limit");
+        List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
+        String header = "LOADONCE_WIDE_ARGV ";
+        if (lines.isEmpty() || !lines.get(0).startsWith(header)) throw new IOException("invalid wide argument witness header");
+        try {
+            int count = Integer.parseInt(lines.get(0).substring(header.length()));
+            if (count < 0 || count > 1000 || lines.size() != count + 1) throw new IOException("invalid wide argument witness count");
+            List<String> result = new ArrayList<>();
+            for (String line : lines.subList(1, lines.size())) {
+                result.add(new String(Base64.getDecoder().decode(line), StandardCharsets.UTF_8));
+            }
+            return List.copyOf(result);
+        } catch (IllegalArgumentException invalid) {
+            throw new IOException("invalid wide argument witness record", invalid);
+        }
     }
 
     private static Map<String, String> cleanEnvironment(Path root, Path javaHome) throws IOException {

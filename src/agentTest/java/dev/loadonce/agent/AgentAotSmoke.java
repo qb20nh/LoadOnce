@@ -161,7 +161,7 @@ public final class AgentAotSmoke {
             throws IOException, InterruptedException {
         Path stdout = root.resolve(label + ".stdout.log");
         Path stderr = root.resolve(label + ".stderr.log");
-        ProcessBuilder builder = new ProcessBuilder(command).directory(root.toFile())
+        ProcessBuilder builder = new ProcessBuilder(WindowsCommandLine.forProcessBuilder(command)).directory(root.toFile())
                 .redirectOutput(stdout.toFile()).redirectError(stderr.toFile());
         builder.environment().clear();
         builder.environment().putAll(environment);

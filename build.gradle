@@ -254,6 +254,8 @@ def nativeRedirectors = tasks.register('nativeRedirectors', Exec) {
 	outputs.files(new File(redirectorDirectory, nativePlatform == 'windows' ? 'java.exe' : 'java'))
 	if (nativePlatform == 'windows') {
 		outputs.file(new File(redirectorDirectory, 'javaw.exe'))
+		inputs.file(layout.projectDirectory.file('native/wide_argument_witness.c'))
+		outputs.file(new File(redirectorDirectory, 'wide-argument-witness.exe'))
 		commandLine 'cmake', '--build', nativeBuildDirectory.absolutePath, '--config', 'Release'
 		dependsOn 'configureNativeRedirectors'
 	} else {
@@ -281,6 +283,14 @@ tasks.register('redirectorSmoke', JavaExec) {
 	mainClass = 'dev.loadonce.agent.RuntimeRedirectTest'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--redirectors-dir', redirectorDirectory.absolutePath
+}
+
+// The subprocess harness quotes literal Windows arguments itself. Legacy
+// ProcessBuilder accepts those complete tokens without stripping interior quotes.
+['agentContractTest', 'agentAotSmoke', 'redirectorSmoke'].each { taskName ->
+	tasks.named(taskName, JavaExec) {
+		jvmArgs '-Djdk.lang.Process.allowAmbiguousCommands=true'
+	}
 }
 
 tasks.register('redirectorDistribution', Zip) {

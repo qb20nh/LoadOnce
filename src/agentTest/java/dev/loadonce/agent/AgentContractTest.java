@@ -125,7 +125,7 @@ public final class AgentContractTest {
     private static Child child(List<String> command, Path directory) throws Exception {
         Path out = Files.createTempFile(directory, "stdout-", ".log");
         Path err = Files.createTempFile(directory, "stderr-", ".log");
-        ProcessBuilder builder = new ProcessBuilder(command);
+        ProcessBuilder builder = new ProcessBuilder(WindowsCommandLine.forProcessBuilder(command));
         builder.directory(directory.toFile());
         builder.environment().clear();
         builder.environment().putAll(cleanEnvironment());
@@ -165,11 +165,31 @@ public final class AgentContractTest {
     private static void ordinaryStartupAndArguments(Path agent, Path directory) throws Exception {
         Path record = directory.resolve("ordinary-main");
         List<String> arguments = List.of("argument with spaces", "", "literal $() ` & ;", "한국어", "--accessToken", "opaque-app-value");
+        List<String> plainCommand = new ArrayList<>(List.of(JAVA.toString(), "-cp", fixtureClasspath(), PlainArgumentsMain.class.getName()));
+        plainCommand.addAll(arguments);
+        Child plain = child(plainCommand, directory);
+        equal(0, plain.code());
+        String expectedArguments = argumentRecord(arguments);
+        String backendArguments = argumentOutput(plain);
+        boolean unicodePreserved = expectedArguments.equals(backendArguments);
+        List<String> observed = decodedArguments(backendArguments);
+        equal(arguments.size(), observed.size());
+        for (int index = 0; index < arguments.size(); index++) {
+            if (arguments.get(index).chars().allMatch(character -> character < 128)) {
+                equal(arguments.get(index), observed.get(index));
+            }
+        }
+        if (!System.getProperty("os.name").startsWith("Windows") || unicodePreserved) {
+            equal(expectedArguments, backendArguments);
+        }
         Child child = child(fixtureCommand(JAVA, agent, record, "normal", arguments), directory);
         equal(0, child.code());
         once(child, record, agent);
-        equal("AGENT_ARGUMENTS " + arguments.stream().map(AgentContractTest::encoded).reduce((a, b) -> a + "," + b).orElse(""),
-                child.stdout().lines().filter(line -> line.startsWith("AGENT_ARGUMENTS ")).findFirst().orElse(""));
+        // Some Windows JDK launchers convert their native command line through
+        // the active code page before premain. Measure that unchanged backend;
+        // the agent must preserve every argument the same JVM actually receives.
+        equal(backendArguments, argumentOutput(child));
+        System.out.println("AGENT_BACKEND unicode_arguments_preserved=" + unicodePreserved);
         check(child.stdout().contains("AGENT_STATUS " + encoded(STATUS + "unavailable checkpoint_guard=false")),
                 "ordinary JVM exposes unavailable through the endpoint without disrupting startup");
         check(child.stdout().contains("AGENT_STATUS_SAFE true"), "public endpoint contains only fixed booleans and identifiers");
@@ -280,9 +300,33 @@ public final class AgentContractTest {
         return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
+    private static String argumentRecord(List<String> arguments) {
+        return "AGENT_ARGUMENTS " + arguments.stream().map(AgentContractTest::encoded).reduce((a, b) -> a + "," + b).orElse("");
+    }
+
+    private static String argumentOutput(Child child) {
+        return child.stdout().lines().filter(line -> line.startsWith("AGENT_ARGUMENTS ")).findFirst().orElse("");
+    }
+
+    private static List<String> decodedArguments(String output) {
+        check(output.startsWith("AGENT_ARGUMENTS "), "backend reports the application argument record");
+        String encoded = output.substring("AGENT_ARGUMENTS ".length());
+        return Stream.of(encoded.split(",", -1))
+                .map(value -> new String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8)).toList();
+    }
+
     private static void deleteTree(Path directory) throws IOException {
         try (Stream<Path> paths = Files.walk(directory)) {
             for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+        }
+    }
+
+    /** Application fixture; no compile-time agent or CRaC dependency. */
+    public static final class PlainArgumentsMain {
+        private PlainArgumentsMain() { }
+
+        public static void main(String[] args) {
+            System.out.println(argumentRecord(List.of(args)));
         }
     }
 
@@ -302,7 +346,7 @@ public final class AgentContractTest {
             System.out.println("AGENT_STATUS " + encoded(status));
             System.out.println("AGENT_STATUS_SAFE " + status.matches("LOADONCE_AGENT initialized=(?:true|false) crac_api=(?:unprobed|unavailable|available|failed) checkpoint_guard=(?:true|false)(?: policy=deny)?"));
             List<String> application = List.of(args).subList(2, args.length);
-            System.out.println("AGENT_ARGUMENTS " + application.stream().map(AgentContractTest::encoded).reduce((a, b) -> a + "," + b).orElse(""));
+            System.out.println(argumentRecord(application));
             if (mode.equals("exit23")) System.exit(23);
             if (mode.equals("checkpoint")) {
                 verifyGuardObjects(agent);
