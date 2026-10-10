@@ -22,6 +22,10 @@ sourceSets {
 		compileClasspath += sourceSets.main.output
 		runtimeClasspath += sourceSets.main.output
 	}
+	launcherTest {
+		compileClasspath += files(layout.buildDirectory.dir('classes/standaloneRuntime'))
+		runtimeClasspath += files(layout.buildDirectory.dir('classes/standaloneRuntime'))
+	}
 }
 
 loom {
@@ -64,7 +68,7 @@ tasks.register('runtimeContractTest', JavaExec) {
 }
 
 tasks.named('check') {
-	dependsOn tasks.named('runtimeContractTest'), tasks.named('prototypeClasses')
+	dependsOn tasks.named('runtimeContractTest'), tasks.named('prototypeClasses'), 'launcherContractTest'
 }
 
 tasks.register('nativeRestorationProbe', JavaExec) {
@@ -149,7 +153,9 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) {
-	source = fileTree('src/main/java/dev/loadonce/runtime') { include '**/*.java' }
+	source = fileTree('src/main/java/dev/loadonce') {
+		include 'runtime/**/*.java', 'launcher/**/*.java'
+	}
 	classpath = files()
 	destinationDirectory = layout.buildDirectory.dir('classes/standaloneRuntime')
 	options.release = 17
@@ -161,11 +167,91 @@ tasks.register('runtimeJar', Jar) {
 	archiveClassifier = 'runtime'
 	dependsOn standaloneRuntime
 	from standaloneRuntime.flatMap { it.destinationDirectory }
+	include 'dev/loadonce/runtime/**', 'LICENSE'
 	from 'LICENSE'
 }
 
+tasks.register('launcherJar', Jar) {
+	group = 'build'
+	description = 'Packages the dependency-free Java/javaw launcher and checkpoint runtime.'
+	archiveClassifier = 'launcher'
+	dependsOn standaloneRuntime
+	from standaloneRuntime.flatMap { it.destinationDirectory }
+	from 'LICENSE'
+	manifest { attributes 'Main-Class': 'dev.loadonce.launcher.LoadOnce' }
+}
+
+tasks.named('compileLauncherTestJava', JavaCompile) {
+	dependsOn standaloneRuntime
+	options.release = 17
+}
+
+tasks.register('launcherContractTest', JavaExec) {
+	group = 'verification'
+	description = 'Exercises Java launcher privacy, fingerprints, fallback and process contracts.'
+	dependsOn tasks.named('launcherTestClasses')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'dev.loadonce.launcher.LauncherContractSuite'
+}
+
+def launcherTestClasspath = sourceSets.launcherTest.runtimeClasspath
+def launcherTestClasspathFile = layout.buildDirectory.file('launcher-test-classpath.txt')
+tasks.register('writeLauncherTestClasspath') {
+	group = 'verification'
+	description = 'Writes the Java integration harness classpath for direct launches.'
+	dependsOn tasks.named('launcherTestClasses')
+	inputs.files(launcherTestClasspath)
+	outputs.file(launcherTestClasspathFile)
+	doLast {
+		launcherTestClasspathFile.get().asFile.text = launcherTestClasspath.filter { it.exists() }.asPath + '\n'
+	}
+}
+
+tasks.register('leydenSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Verifies real AOT cache training/mapping and one-launch fallback on the selected JDK.'
+	dependsOn tasks.named('launcherTestClasses')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'dev.loadonce.launcher.LeydenSmoke'
+}
+
+tasks.register('cracIntegrationSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Verifies isolated CRaC images, fresh-process reconstruction and manifest fallback.'
+	dependsOn tasks.named('launcherTestClasses'), tasks.named('runtimeJar')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'dev.loadonce.launcher.CracIntegrationSmoke'
+	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
+		args '--java', providers.gradleProperty('loadonceCracJava').get()
+	}
+	if (providers.gradleProperty('loadonceCracEngine').isPresent()) {
+		args '--engine', providers.gradleProperty('loadonceCracEngine').get()
+	}
+	if (providers.gradleProperty('loadonceNativeCrac').getOrElse('false').toBoolean()) {
+		dependsOn tasks.named('writeNativeProbeClasspath')
+		args '--native-classpath-file', nativeProbeClasspathFile.get().asFile.absolutePath
+	}
+	if (providers.gradleProperty('loadonceReconfigure').getOrElse('false').toBoolean()) {
+		args '--native-reconfigure'
+	}
+}
+
+tasks.register('nativeDisplaySmoke', JavaExec) {
+	group = 'verification'
+	description = 'Runs native reconstruction on a private authenticated software display using Java.'
+	dependsOn tasks.named('launcherTestClasses'), tasks.named('writeNativeProbeClasspath')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'dev.loadonce.launcher.NativeDisplaySmoke'
+	if (providers.gradleProperty('loadonceXvfb').isPresent()) {
+		args '--xvfb', providers.gradleProperty('loadonceXvfb').get()
+	}
+	args '--cycles', providers.gradleProperty('loadonceCycles').getOrElse('10')
+	if (providers.gradleProperty('loadonceReconfigure').getOrElse('false').toBoolean()) args '--reconfigure'
+	if (providers.gradleProperty('loadonceInvalidShader').getOrElse('false').toBoolean()) args '--invalid-shader'
+}
+
 tasks.named('build') {
-	dependsOn tasks.named('runtimeJar')
+	dependsOn tasks.named('runtimeJar'), tasks.named('launcherJar')
 }
 
 java {

@@ -1,143 +1,124 @@
 # LoadOnce
 
-LoadOnce is a prototype for reusing JVM initialization and reconstructing external resources. The current checkout contains a Fabric 26.3 test target, a loader-independent checkpoint lifecycle library, a Linux JVM command wrapper, and an isolated LWJGL restoration probe.
+LoadOnce uses Java JARs to reuse JVM initialization and reconstruct external resources. It contains a standalone Java/javaw launcher, a loader-independent checkpoint lifecycle library, a Fabric 26.3 mod target, and real GLFW/OpenGL/OpenAL restoration probes. Application code, launcher tools and integration harnesses use Java; no Python or project shell helper is required.
 
-An opt-in Fabric diagnostic now verifies conventional startup to Minecraft's rendered main menu, including completed GPU readback. Minecraft 26.3 uses SDL/RenderPearl with OpenGL and Vulkan backends; the GLFW restoration probe exercises reconstruction independently. Reusable Minecraft process images and SDL restoration are still unimplemented.
+The launcher selects Leyden or CRaC startup flags before starting the application. Mod hooks own the resource lifecycle inside the running game. An agent attached after startup cannot supply JVM startup flags retroactively. The current Minecraft integration observes conventional startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented.
 
-## Build and contract checks
+## Build and Java checks
 
-Use JDK 25 and Python 3.10 or newer on Linux. In the prepared cloud workspace, first refresh and activate the retained tools:
-
-```sh
-bash /workspace/.loadonce/setup/configure-runtime.sh
-source /workspace/.loadonce/setup/activate.sh
-cd /workspace/LoadOnce
-bash ./gradlew --no-daemon --console=plain --max-workers=2 build
-python3 -m unittest discover -s tests -v
-python3 tests/smoke_leyden.py
-```
-
-`build` compiles both Minecraft source sets and the native probe, and runs the executable `runtimeContractTest` through `check`. It also produces a standalone Java 17 runtime JAR with the `runtime` classifier, containing no Minecraft or Fabric dependencies. The default Gradle `test` task has no JUnit sources; the runtime contract tests and Python suite are separate checks.
-
-## Checkpoint resource lifecycle
-
-`dev.loadonce.runtime.CheckpointCoordinator` captures its owner thread. Register resource dependencies first. It quiesces and releases resources in reverse dependency order, recreates them in dependency order, and resumes producers only after every restoration succeeds.
-
-A host integration supplies a `CheckpointGate` that must prove the lifecycle boundary is reusable: credentials, sessions, connections, world state, and unmanaged external resources must be excluded. The library cannot establish that proof for an arbitrary game or mod. A denied gate changes no resources. Partial preparation is compensated; failed compensation or restoration stops every participant and leaves the coordinator `STOPPED`.
-
-`CracBridge` optionally registers a strongly held resource with the actual `jdk.crac` API through reflection. It does not implement a checkpoint engine or simulate CRaC callbacks. The clean fixture driver compiles the standalone runtime, checks failure recovery through real callbacks, creates an image, and restores that same image into three fresh JVMs:
+Use JDK 25 to build the Minecraft target and run the native tests:
 
 ```sh
-python3 tools/smoke_crac.py --java /path/to/crac-jdk/bin/java
+./gradlew build
+./gradlew leydenSmoke
 ```
 
-This has passed with Azul CRaC JDK 25.0.4.1's `warp` engine without elevated kernel capabilities. It checks a retained heap witness, value, callback counts, coordinator state and kernel process IDs. It also tests gate denial, preparation/restoration failure and real open-file rejection. Logs and private fixture images remain under `build/crac-validation/`. The driver excludes inherited launcher credentials and injected JVM/native options; it only checkpoints its isolated fixture.
+`build` compiles both mod source sets, runs the lifecycle and Java launcher contracts, and creates three artifacts under `build/libs/`:
 
-`--engine simengine` verifies callbacks without an image; `--engine criuengine` exercises CRIU on a capable host. This container blocks CRIU. Engine options and successful checkpoint exit codes differ: a fatal engine failure needs launcher/supervisor recovery. The original `cracSmoke` Gradle task remains available for manually configured runtimes, but its child inherits the caller environment. Use the clean driver for saved images.
+- `modid-1.0.0.jar`: Fabric mod with opt-in client observation hooks.
+- `modid-1.0.0-runtime.jar`: checkpoint lifecycle library without Minecraft/Fabric dependencies.
+- `modid-1.0.0-launcher.jar`: executable Java 17 launcher and lifecycle library, with no third-party dependencies.
 
-## GLFW, graphics, and audio reconstruction
+In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate.sh` to select the retained JDK and Gradle cache. The launcher's code targets Java 17; Leyden training requires a supporting JVM, and CRaC requires a CRaC-enabled JVM. The current cache/image privacy implementation requires POSIX ownership and permissions. Unsupported cache platforms select an ordinary application launch; Windows/javaw cache behavior has not been verified.
 
-`nativeRestorationProbe` creates and destroys real LWJGL 3.4.3 resources. It verifies GLFW window settings, elapsed time, six native callback registrations and delivered resize events; OpenGL texture and buffer contents, shader linking, framebuffer completeness and rendered pixels; and OpenAL device/context, PCM format, source attachment, playback state and sample offset. It retains CPU descriptors, checks native object deletion/context detachment and clears tracked handle values after release. Numeric handle values may be reused by drivers.
+## Java/javaw launcher and Leyden
 
-With an existing X11 display and audio device:
+Probe the selected JVM rather than assuming its version provides CRaC or Leyden:
 
 ```sh
-bash ./gradlew nativeRestorationProbe -PloadonceCycles=10
+java -jar build/libs/modid-1.0.0-launcher.jar doctor --java /path/to/jdk/bin/java
 ```
 
-With Xvfb and Mesa software rendering, use the managed display wrapper:
+`doctor` also checks CRaC core classes and can run `criu check` with `--criu /path/to/criu`. Capability presence does not prove safe game checkpointing.
+
+Train once explicitly, then wrap the same original Java command:
 
 ```sh
-tools/native-smoke.sh --xvfb /path/to/Xvfb
+java -jar build/libs/modid-1.0.0-launcher.jar train --cache-dir build/aot-cache \
+  --input mods --input config --input resourcepacks -- \
+  /path/to/jdk/bin/java -cp application.jar your.MainClass
+java -jar build/libs/modid-1.0.0-launcher.jar run --cache-dir build/aot-cache \
+  --input mods --input config --input resourcepacks -- \
+  /path/to/jdk/bin/java -cp application.jar your.MainClass
 ```
 
-The wrapper defaults to ten cycles and `-PloadonceAudioLoopback=true`. OpenAL Soft's loopback device renders 2,048 float PCM samples per generation, requires nonzero output, compares them with the initial render within `1e-6`, and checks playback cursor advancement. The primary source remains muted; the verification source renders only to memory. `SOFT_buffer_samples` readback runs when the extension is available. No physical audio device is needed.
+The same launcher JAR can be started by `javaw`. It supplies JVM startup options to a child JVM; it does not replace the system Java executable or globally intercept unrelated launches. Original application argument boundaries and environment are preserved. Declare dynamically loaded mods/configuration/resources with repeated `--input`. Development classpath directories containing files cannot be trained by JDK 25 AOT; package those classes into JARs first.
 
-The wrapper uses an authenticated temporary X11 display and cleans up its processes and private directories. It requires `Xvfb`, `xauth`, `setsid`, and Mesa. Set `LOADONCE_XVFB` or use `--xvfb` for an extracted binary. With an existing display, `bash ./gradlew nativeRestorationProbe -PloadonceAudioLoopback=true` runs the same PCM checks. The default device path and `ALSOFT_DRIVERS=null` remain supported. Software rendering and loopback audio do not establish hardware GPU or physical audio restoration; real keyboard/mouse interaction and controllers also need additional checks.
+Fingerprints cover the runtime, arguments, working directory, classpath and transitive local manifest dependencies, module paths, agents, explicit native paths and declared inputs. Private immutable generations and an atomic `manifest.properties` completion marker prevent partial training from replacing a working cache. Missing, changed, corrupt, busy or unsupported caches select ordinary startup before the application begins. A warm application failure is returned without replay; `AOTMode=auto` can discard incompatible data inside that single JVM.
 
-To change settings before each boundary and verify their reconstruction:
+Known credential environments, secret-bearing launch options and credential-bearing proxy URLs disable caching and reject training. Use `--sensitive` for custom credentials or secrets read from application files. Argument files, injected JVM options (including `JDK_AOT_VM_OPTIONS`) and native-library injection select ordinary startup. Metadata stores digests rather than command text. AOT schema 3 and fixture schema 2 invalidate the former prototype's JSON artifacts. Leyden reuses class/linking data; these tests do not claim a saved heap, warmed machine code or measured startup gains.
+
+## Checkpoint lifecycle and isolated images
+
+`CheckpointCoordinator` binds to its owner thread. Register dependencies first; preparation releases resources in reverse dependency order, restoration recreates them in dependency order, and producers resume after every restoration succeeds. A denied gate changes no resources. Failed preparation is compensated; failed compensation/restoration stops every participant and leaves the coordinator `STOPPED`.
+
+The host's `CheckpointGate` must establish a reusable boundary excluding credentials, sessions, connections, persistent world state and unmanaged external resources. `CracBridge` registers with the actual optional `jdk.crac` API through reflection. Neither component supplies a checkpoint engine or makes arbitrary games safe to snapshot.
+
+Run real isolated image checks with a verified CRaC JDK:
 
 ```sh
-tools/native-smoke.sh --xvfb /path/to/Xvfb -- nativeRestorationProbe \
-  -PloadonceCycles=10 -PloadonceAudioLoopback=true -PloadonceReconfigure=true
+./gradlew cracIntegrationSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java
 ```
 
-Quiescence reads actual window dimensions, position, visibility, resizability, cursor/input modes, close flag and GLFW clock. Audio snapshots the source's gain, looping mode, playing/paused/stopped state and frozen sample cursor. Changed loopback sources must render PCM when playing and silence when paused/stopped; the ten-cycle scenario also checks finite-buffer exhaustion. A separate reference render still checks sample equality. Physical playback cursors advance asynchronously.
+The Java harness verifies real callbacks, descriptor rejection, capture and three distinct process restores, retained heap/PID evidence, compatibility/corruption fallback and failed restore without replay. `-PloadonceCracEngine=simengine` checks callbacks and explicitly claims no image; `criuengine` requires suitable kernel capabilities. Warp has passed without elevated capabilities on the selected host.
 
-The failure probe must exit unsuccessfully after an invalid shader interrupts restoration. Its output must include `coordinator-state=STOPPED`, `failure-stop-verified=true`, and `cleanup=tracked-handles-zero native-release=ok`:
-
-```sh
-bash ./gradlew nativeRestorationProbe -PloadonceInvalidShader=true
-```
-
-To test an actual native process image with a minimal environment:
-
-```sh
-bash ./gradlew writeNativeProbeClasspath
-tools/native-smoke.sh --xvfb /path/to/Xvfb --command \
-  python3 tools/smoke_crac.py --java /path/to/crac-jdk/bin/java \
-  --native-classpath-file build/native-probe-classpath.txt --native-reconfigure
-```
-
-This test requires the selected runtime to accept all resources after teardown and complete new-process reconstruction. See the continuation notes for current native image evidence and remaining blockers. The `--command` mode preserves argument boundaries and returns the driver's status.
-
-## Private fixture images and fallback
-
-`tools/crac_fixture.py` adds explicit capture and prelaunch validation for the CPU and native fixtures. It fingerprints the runtime, kernel, classpath/manifest dependencies, fixed fixture arguments, display/authentication configuration and caller-declared native providers. Its private atomic manifest covers image bytes and extracted LWJGL libraries. Missing, corrupt, incompatible or busy images select one cold fixture launch. A failed restore is returned without replay.
-
-After `build`, write a file containing the absolute standalone runtime JAR path, then capture/run the CPU fixture:
+For explicit CPU fixture capture/run:
 
 ```sh
 realpath build/libs/*-runtime.jar > build/crac-fixture-classpath.txt
-python3 tools/crac_fixture.py capture --java /path/to/crac-jdk/bin/java \
-  --cache-dir build/fixture-cache --classpath-file build/crac-fixture-classpath.txt
-python3 tools/crac_fixture.py run --java /path/to/crac-jdk/bin/java \
-  --cache-dir build/fixture-cache --classpath-file build/crac-fixture-classpath.txt
+java -jar build/libs/modid-1.0.0-launcher.jar fixture-capture \
+  --java /path/to/crac-jdk/bin/java --cache-dir build/fixture-cache \
+  --classpath-file build/crac-fixture-classpath.txt
+java -jar build/libs/modid-1.0.0-launcher.jar fixture-run \
+  --java /path/to/crac-jdk/bin/java --cache-dir build/fixture-cache \
+  --classpath-file build/crac-fixture-classpath.txt
 ```
 
-For the native fixture, use `build/native-probe-classpath.txt`, `--native --reconfigure`, and repeated `--input` for external graphics/windowing provider files or directories. Keep the same authenticated display alive for capture and restores. A newly allocated display or changed Xauthority selects cold startup. Provider discovery is caller-owned; undeclared host libraries are not automatically detected. This launcher accepts only these isolated fixtures, not Minecraft or an arbitrary application command.
+These actions accept only `CracSmoke` or `NativeRestorationProbe`. A minimal child environment excludes inherited credentials and JVM/native injection. Image validation covers runtime/kernel, classpath dependencies, fixed fixture arguments, selected display/Xauthority, declared providers, image bytes and extracted native libraries. A failed preflight selects one cold fixture launch. After a restore child starts, failure or timeout never triggers another launch.
+
+CRaC fixtures use Linux `setsid`/`kill` utilities through Java's `ProcessBuilder` to stop their entire process group on cancellation, including orphaned engine helpers. No shell command strings are used. Native providers outside the classpath require explicit `--input` entries; automatic host-library discovery is not implemented. Images, cookies and logs stay private and are never uploaded as build artifacts.
+
+## GLFW, graphics and audio reconstruction
+
+`NativeRestorationProbe` owns real LWJGL 3.4.3 resources and retains their CPU descriptors. It checks native deletion/context detachment, callbacks and resize delivery, GLFW settings/clock, OpenGL buffer/texture readback and rendered pixels, and OpenAL PCM/playback state. The changed-settings scenario includes gain/looping/cursor changes, playing/paused/stopped sources and finite-buffer exhaustion. In loopback mode, actual rendered PCM must match the reference within `1e-6`; paused/stopped sources must remain silent.
+
+The Java display harness creates an authenticated temporary Xvfb display and bounds startup, child execution and cleanup. It requires native `Xvfb`, `xauth` and Mesa providers:
+
+```sh
+./gradlew nativeDisplaySmoke
+./gradlew nativeDisplaySmoke -PloadonceReconfigure=true
+./gradlew nativeDisplaySmoke -PloadonceReconfigure=true -PloadonceInvalidShader=true
+```
+
+All default runs use ten cycles and in-memory OpenAL loopback. The invalid-shader task succeeds only when the child fails with coordinator `STOPPED` and releases every tracked handle. Use `-PloadonceXvfb=/path/to/Xvfb` for an extracted binary. With an existing display, `./gradlew nativeRestorationProbe -PloadonceAudioLoopback=true` remains available.
+
+To verify a native process image while keeping its authenticated display alive, build the Java harness classpath and launch it directly:
+
+```sh
+./gradlew writeLauncherTestClasspath writeNativeProbeClasspath
+java -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.NativeDisplaySmoke \
+  --xvfb /path/to/Xvfb --command /path/to/jdk/bin/java \
+  -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.CracIntegrationSmoke \
+  --java /path/to/crac-jdk/bin/java --native-classpath-file build/native-probe-classpath.txt \
+  --native-reconfigure
+```
+
+For persistent native fixture capture/run, use that native classpath plus `--native --reconfigure` and repeated `--input` provider paths. Keep the same display/authentication alive for all launches; changing Xauthority selects cold startup. Software rendering and explicit null hardware audio avoid OpenAL's unused library-global PulseAudio dispatcher while loopback still renders real PCM. Production PulseAudio shutdown and hardware GPU/audio reconstruction need separate work.
 
 ## Minecraft rendered-menu diagnostic
 
-The diagnostic is disabled by default. On a configured display, opt in with:
+The Fabric diagnostic is disabled by default. On a configured display:
 
 ```sh
-bash ./gradlew runClient -PloadonceMenuProbe=true -PloadonceMenuScreenshot=true \
+./gradlew runClient -PloadonceMenuProbe=true -PloadonceMenuScreenshot=true \
   -PloadonceMenuGameDir=build/menu-probe/game -PloadonceMenuTimeout=120
 ```
 
-It requires a loaded `TitleScreen` with opaque active widgets, no overlay/world/connection, consecutive extraction and successful presentation of three frames, and completed nonuniform GPU framebuffer readback. Optional PNGs are written inside the selected game directory's `loadonce-menu-probe/`. A fresh test directory needs the ordinary `onboardAccessibility:false` option to skip first-run accessibility onboarding.
+It requires a loaded `TitleScreen`, opaque active widgets, no overlay/world/connection, three extracted and successfully presented frames, and completed nonuniform GPU readback. Optional PNGs go inside the selected game directory's `loadonce-menu-probe/`. A fresh test directory needs the ordinary `onboardAccessibility:false` option to skip first-run onboarding.
 
-Judge success by `LOADONCE_MENU_PROBE_PASSED` and absence of `LOADONCE_MENU_PROBE_FAILED`; a timeout can also stop the game cleanly with exit 0. Keep an outer process deadline for native hangs. The measured software Vulkan client reached the rendered menu; the marker explicitly reports that human input, restoration and checkpointing were not verified. Physical audio and authentication readiness require their own checks.
+Require `LOADONCE_MENU_PROBE_PASSED` and no `LOADONCE_MENU_PROBE_FAILED`; failure can also stop the game cleanly with exit 0. Keep an outer process deadline for native hangs. The selected software Vulkan client reached the rendered menu. Human input, authentication readiness, physical audio and SDL restoration remain unverified; no Minecraft checkpoint was taken.
 
-## Leyden AOT command wrapper
-
-The wrapper probes the selected Java executable rather than assuming its version provides CRaC or Leyden. `doctor` also runs CRIU's kernel check when `criu` is on `PATH`:
-
-```sh
-python3 tools/loadonce.py doctor --java "$JAVA_HOME/bin/java"
-```
-
-For a JAR-based launch, explicitly train once, then wrap the same original command:
-
-```sh
-python3 tools/loadonce.py train --cache-dir build/aot-cache \
-  --input mods --input config --input resourcepacks -- \
-  "$JAVA_HOME/bin/java" -cp application.jar your.MainClass
-python3 tools/loadonce.py run --cache-dir build/aot-cache \
-  --input mods --input config --input resourcepacks -- \
-  "$JAVA_HOME/bin/java" -cp application.jar your.MainClass
-```
-
-Training executes the application once and promotes a cache only after a successful exit and unchanged inputs. Declare dynamically loaded mods, configuration and resource inputs with repeated `--input`; there is no universal loader discovery yet. JDK 25 rejects nonempty classpath directories for AOT training, so development launches normally need packaged JARs. Modular JAR launches are also supported.
-
-The fingerprint covers the JVM binary/libraries/configuration, original arguments, relevant environment, classpath and manifest dependencies, module paths, agents and declared inputs. It reads their contents on each launch, so fingerprinting has a cost that is not yet optimized. Private cache entries require a complete manifest and matching archive checksum. Unsupported, missing, changed, corrupt or busy caches fall back before launching the application. A child launch is never replayed after failure; the JVM may discard incompatible AOT data during that single launch.
-
-Recognized sensitive launch options and known credential environment variables disable caching and reject training; use `--sensitive` for custom secret-bearing options or credentials read from application files. Argument files, injected JVM options (including `JDK_AOT_VM_OPTIONS`) and native-library injection environments also select ordinary startup. LWJGL's explicit library and extraction paths are content-fingerprinted. Cache schema 2 rejects older artifacts created before the environment protections. Original argument boundaries and authentication behavior are preserved. Metadata contains digests rather than argument text. The AOT cache reuses JVM class/linking data; it is not a saved application process or warmed JIT machine-code cache.
-
-## Current evidence and next step
-
-See [prototype validation and continuation notes](docs/prototype-status.md) for the exact environment evidence and restart requirements. The next integration work is to capture Minecraft's renderer/resource ownership and a credential-free lifecycle boundary, then prove an interactive main menu on supported hardware. Startup speed and memory improvements have not been measured yet.
+See [validation and continuation notes](docs/prototype-status.md) for recorded host evidence and remaining limits.
 
 ## License
 
