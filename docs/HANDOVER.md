@@ -287,6 +287,10 @@ The default local JDK path is `build/local-runtime/zulu25.36.205-ca-crac-jdk25.0
 
 Runtime/provider/controller, kernel/namespace mapping, launch request including session arguments, classpath/dependencies, mods, display/session endpoint environment and Xauthority changes invalidate an image. The newly initialized game reads current settings and persistent world data. Current prototype tasks do not attach an authenticated launcher session or enable the ordinary executable wrapper to restore game images. See [current prototype evidence](prototype-status.md#linux-minecraft-early-jvm-prototype).
 
+## Initialized-state continuation
+
+The application and developer contract is now continuation of initialized game/mod state after a pause. Separate external-CRIU and whole-KVM-guest acceptance harnesses retain object, native-handle and thread witnesses; they do not alter the installed wrapper's startup policy. See [initialized-state evidence and commands](transparent-state-prototype.md) for the verified CPU restores, Minecraft status, guest prerequisites and remaining integration work.
+
 ## Source navigation
 
 | Area | Main entry points |

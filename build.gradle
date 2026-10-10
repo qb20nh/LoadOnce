@@ -252,7 +252,7 @@ tasks.register('compileMinecraftPrototypeFixtureMod', JavaCompile) {
 }
 tasks.register('minecraftPrototypeFixtureMod', Jar) {
 	group = 'verification'
-	description = 'Builds a separate optional mod for observing fresh initialization on cold and warm boots.'
+	description = 'Builds an optional mod with initialization and retained-thread witnesses.'
 	dependsOn 'compileMinecraftPrototypeFixtureMod'
 	archiveFileName = 'loadonce-additional-mod-fixture.jar'
 	destinationDirectory = layout.buildDirectory.dir('minecraft-prototype')
@@ -502,6 +502,48 @@ tasks.register('criuNamespaceSmoke', JavaExec) {
 		args '--java', providers.gradleProperty('loadonceCracJava').get()
 	}
 	args '--criu', providers.gradleProperty('loadonceCriu').getOrElse('/usr/bin/criu')
+}
+
+tasks.register('opaqueStateSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Opt-in external CRIU acceptance of initialized JVM state without application callbacks.'
+	dependsOn tasks.named('writeLauncherTestClasspath')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.launcher.OpaqueProcessSmoke'
+	args '--work-directory', layout.buildDirectory.dir('opaque-process-validation').get().asFile.absolutePath
+}
+
+tasks.register('opaqueMinecraftSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Experimental whole-tree CRIU acceptance of an initialized software-rendered Minecraft menu.'
+	dependsOn tasks.named('writeLauncherTestClasspath'), tasks.named('compileClientJava'), tasks.named('writeMinecraftPrototypeSpec')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.launcher.OpaqueProcessSmoke'
+	args '--work-directory', layout.buildDirectory.dir('opaque-minecraft-validation').get().asFile.absolutePath,
+			'--spec', layout.buildDirectory.file('minecraft-prototype/spec.properties').get().asFile.absolutePath,
+			'--xvfb', providers.gradleProperty('loadonceXvfb').getOrElse('/usr/bin/Xvfb')
+}
+
+tasks.register('vmStateSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Opt-in KVM snapshot acceptance of initialized JVM, guest kernel and native state.'
+	dependsOn tasks.named('writeLauncherTestClasspath')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.launcher.VmStateSmoke'
+	args '--qemu-directory', providers.gradleProperty('loadonceQemuDirectory').getOrElse('/'),
+			'--work-directory', layout.buildDirectory.dir('vm-state-validation').get().asFile.absolutePath
+}
+
+tasks.register('vmMinecraftSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Experimental KVM snapshot acceptance of an initialized Minecraft menu and external mod state.'
+	dependsOn tasks.named('writeLauncherTestClasspath'), tasks.named('compileClientJava'), tasks.named('writeMinecraftPrototypeSpec')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.launcher.VmStateSmoke'
+	args '--qemu-directory', providers.gradleProperty('loadonceQemuDirectory').getOrElse('/'),
+			'--work-directory', layout.buildDirectory.dir('vm-minecraft-validation').get().asFile.absolutePath,
+			'--spec', layout.buildDirectory.file('minecraft-prototype/spec.properties').get().asFile.absolutePath,
+			'--xvfb', providers.gradleProperty('loadonceXvfb').getOrElse('/usr/bin/Xvfb')
 }
 
 tasks.register('nativeDisplaySmoke', JavaExec) {

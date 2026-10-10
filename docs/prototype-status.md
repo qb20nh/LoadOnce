@@ -54,6 +54,10 @@ This path uses private Linux user/PID/network/IPC/UTS/cgroup/mount namespaces wi
 
 Image fingerprints cover the runtime, external CRIU, controller, kernel and namespace mapping, launch request including session arguments, classpath/dependencies, mod files and display/session endpoint environment including Xauthority bytes. Changes invalidate the image before restore. Current game settings and persistent worlds are read afresh rather than cached in the heap. The namespace controller waits for explicit CRIU dump completion before exiting; capture publication requires substantial image bytes, unchanged inputs and owner-only sealed payload. After restoration, the bootstrap restores the retained `java.class.path` property before fresh Fabric discovery because CRaC otherwise applies the restore command's default property. Warm acceptance requires the retained heap witness, expected namespace PID/callbacks, a distinct host controller and game verification markers. Images/logs stay private under ignored build paths and are not build artifacts.
 
+## Initialized-state continuation
+
+The stronger initialized-game/mod continuation contract and its external-CRIU/KVM experiments are recorded separately in [initialized-state prototype status](transparent-state-prototype.md). The early-JVM evidence above verifies fresh game initialization after restoring its bootstrap.
+
 ## External launchers and redirected Java executables
 
 The external-launcher integration now runs a Java 17 supervisor behind private Linux `java` and Windows `java.exe`/`javaw.exe` executables. Prism, Modrinth, CurseForge and vanilla select that executable; normal launches need no manually invoked JAR launcher. The installed supervisor uses the launcher artifact internally, with all startup/cache policy in Java. A direct premain-only configuration remains available. See [setup and boundaries](external-launchers.md).

@@ -32,7 +32,12 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -44,9 +49,10 @@ public final class FabricPrototypeBootProbe {
 	private static final Logger LOGGER = LoggerFactory.getLogger("loadonce-prototype");
 	private static final String WORLD = "LoadOncePrototype";
 	private static FabricPrototypeBootProbe instance;
+	private static int initializations;
 
 	private enum Outcome { RUNNING, PASSED, FAILED }
-	private enum Phase { MENU, MENU_READBACK, MENU_INPUT, LOADING, WORLD, WORLD_READBACK,
+	private enum Phase { MENU, MENU_READBACK, MENU_INPUT, MENU_HOLD, LOADING, WORLD, WORLD_READBACK,
 		WORLD_INPUT, WRITE_WITNESS, SAVING, RELOADING, RELOADED, RELOADED_READBACK }
 
 	private final long startedNanos = System.nanoTime();
@@ -82,6 +88,17 @@ public final class FabricPrototypeBootProbe {
 	private long frameSequence;
 	private long dialogInputFrame = -10;
 	private Screen submittedDialog;
+	private final UUID probeIdentity = UUID.randomUUID();
+	private Path opaqueDirectory;
+	private boolean opaqueReleased;
+	private String opaqueGeneration;
+	private Minecraft retainedClient;
+	private Object retainedWindow;
+	private Object retainedRenderer;
+	private Object retainedRenderTarget;
+	private long retainedWindowHandle;
+	private long readyWallMillis;
+	private long readyNanos;
 
 	private FabricPrototypeBootProbe() {}
 
@@ -89,7 +106,7 @@ public final class FabricPrototypeBootProbe {
 		if (!Boolean.getBoolean("loadonce.prototype.verify")) {
 			return;
 		}
-		if (instance != null) {
+		if (instance != null || ++initializations != 1) {
 			throw new IllegalStateException("LoadOnce prototype probe already initialized");
 		}
 		instance = new FabricPrototypeBootProbe();
@@ -192,6 +209,16 @@ public final class FabricPrototypeBootProbe {
 					return;
 				}
 				worldDirectory = gameDirectory.resolve("saves").resolve(WORLD);
+				String directory = System.getProperty("loadonce.prototype.opaqueDirectory");
+				if (directory != null) {
+					opaqueDirectory = Path.of(directory).toAbsolutePath().normalize();
+					checkOpaqueNode(opaqueDirectory, true);
+					if (!opaqueDirectory.equals(opaqueDirectory.toRealPath())
+							|| !Files.isRegularFile(gameDirectory.resolve(".loadonce-prototype"), LinkOption.NOFOLLOW_LINKS)
+							|| !"loadonce-opaque-v1\n".equals(readOpaqueFile(opaqueDirectory.resolve(".loadonce-opaque")))) {
+						throw new IOException("Opaque prototype workspace marker is invalid");
+					}
+				}
 			}
 			switch (phase) {
 				case MENU_INPUT -> {
@@ -200,9 +227,14 @@ public final class FabricPrototypeBootProbe {
 					} else if (menuScreen.getFocused() != null && menuScreen.getFocused() != focusBefore) {
 						menuInputVerified = true;
 						LOGGER.info("LOADONCE_PROTOTYPE_INPUT phase=menu evidence=sdl-tab-focus-change");
-						openWorld(client);
+						if (opaqueDirectory != null && !opaqueReleased) {
+							holdInitializedMenu(client);
+						} else {
+							openWorld(client);
+						}
 					}
 				}
+				case MENU_HOLD -> resumeInitializedMenu(client);
 				case LOADING -> {
 					continueFixtureBackupWarning(client);
 					if (eligibleWorld(client)) {
@@ -250,9 +282,111 @@ public final class FabricPrototypeBootProbe {
 				default -> { }
 			}
 		} catch (Exception failure) {
+			if (opaqueDirectory != null) {
+				LOGGER.error("LOADONCE_OPAQUE_FAILED phase={} workspace={} reason={}", phase, opaqueDirectory, failure.toString());
+			}
 			fail("tick-" + failure.getClass().getSimpleName());
 		} finally {
 			advancing = false;
+		}
+	}
+
+	private void holdInitializedMenu(Minecraft client) throws IOException {
+		Path modReady = opaqueDirectory.resolve("mod-ready.properties");
+		if (!Files.exists(modReady, LinkOption.NOFOLLOW_LINKS)) {
+			return;
+		}
+		Properties mod = new Properties();
+		mod.load(new java.io.StringReader(readOpaqueFile(modReady)));
+		UUID.fromString(mod.getProperty("identity"));
+		if (!"1".equals(mod.getProperty("calls")) || Long.parseLong(mod.getProperty("counter")) < 1) {
+			throw new IOException("Opaque fixture has not initialized its thread");
+		}
+		retainedClient = client;
+		retainedWindow = client.getWindow();
+		retainedRenderer = client.gameRenderer;
+		retainedRenderTarget = client.gameRenderer.mainRenderTarget();
+		retainedWindowHandle = client.getWindow().handle();
+		readyWallMillis = System.currentTimeMillis();
+		readyNanos = System.nanoTime();
+		phase = Phase.MENU_HOLD;
+		writeOpaqueFile("probe-ready.properties", opaqueEvidence(client) + "mod_identity=" + mod.getProperty("identity") + "\n");
+		LOGGER.info("LOADONCE_OPAQUE_READY probeIdentity={} calls={} phase=MENU_HOLD wallMillis={} nanoTime={}",
+				probeIdentity, initializations, readyWallMillis, readyNanos);
+	}
+
+	private void resumeInitializedMenu(Minecraft client) throws IOException {
+		if (instance != this || initializations != 1 || client != retainedClient || client.gui.screen() != menuScreen
+				|| client.getWindow() != retainedWindow || client.gameRenderer != retainedRenderer
+				|| client.gameRenderer.mainRenderTarget() != retainedRenderTarget
+				|| client.getWindow().handle() != retainedWindowHandle || !eligibleMenu(client)) {
+			throw new IOException("Initialized opaque menu objects changed");
+		}
+		Path release = opaqueDirectory.resolve("release");
+		if (!Files.exists(release, LinkOption.NOFOLLOW_LINKS)) {
+			return;
+		}
+		String generation = readOpaqueFile(release);
+		if (!generation.matches("[1-3]\\n")) {
+			throw new IOException("Opaque release generation must be 1, 2 or 3");
+		}
+		generation = generation.strip();
+		Properties ready = new Properties();
+		ready.load(new java.io.StringReader(readOpaqueFile(opaqueDirectory.resolve("probe-ready.properties"))));
+		if (!probeIdentity.toString().equals(ready.getProperty("probe_identity"))) {
+			throw new IOException("Opaque retained probe identity differs from readiness evidence");
+		}
+		opaqueReleased = true;
+		opaqueGeneration = generation;
+		menuFrames = 0;
+		menuInputVerified = false;
+		focusBefore = null;
+		phase = Phase.MENU;
+		writeOpaqueFile("probe-resumed-" + generation + ".properties", "generation=" + generation + "\n"
+				+ opaqueEvidence(client) + "ready_wall_millis=" + readyWallMillis + "\nready_nano_time=" + readyNanos + "\n");
+		LOGGER.info("LOADONCE_OPAQUE_RESUMED generation={} probeIdentity={} calls={} retainedObjects=true wallElapsedMs={} nanoElapsedNs={}",
+				generation, probeIdentity, initializations, System.currentTimeMillis() - readyWallMillis, System.nanoTime() - readyNanos);
+	}
+
+	private String opaqueEvidence(Minecraft client) {
+		return "probe_identity=" + probeIdentity + "\ncalls=" + initializations
+				+ "\nclient_identity=" + System.identityHashCode(client) + "\nmenu_identity=" + System.identityHashCode(menuScreen)
+				+ "\nrenderer_identity=" + System.identityHashCode(client.gameRenderer)
+				+ "\nwindow_identity=" + System.identityHashCode(client.getWindow())
+				+ "\nrender_target_identity=" + System.identityHashCode(client.gameRenderer.mainRenderTarget())
+				+ "\nwindow_handle=" + client.getWindow().handle() + "\nwall_millis=" + System.currentTimeMillis()
+				+ "\nnano_time=" + System.nanoTime() + "\n";
+	}
+
+	private static void checkOpaqueNode(Path path, boolean directory) throws IOException {
+		var attributes = Files.readAttributes(path, "unix:uid,mode,nlink", LinkOption.NOFOLLOW_LINKS);
+		if (Files.isSymbolicLink(path) || !(directory ? Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)
+				: Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+				|| !attributes.get("uid").equals(Files.getAttribute(Path.of("/proc/self"), "unix:uid"))
+				|| (((Number) attributes.get("mode")).intValue() & 07777) != (directory ? 0700 : 0600)
+				|| (!directory && ((Number) attributes.get("nlink")).intValue() != 1)) {
+			throw new IOException("Opaque workspace must contain only private owner-controlled files: " + path);
+		}
+	}
+
+	private static String readOpaqueFile(Path path) throws IOException {
+		checkOpaqueNode(path, false);
+		try (var input = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+			byte[] bytes = input.readNBytes(4097);
+			if (bytes.length > 4096) throw new IOException("Opaque evidence exceeds 4096 bytes: " + path);
+			return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+		}
+	}
+
+	private void writeOpaqueFile(String name, String content) throws IOException {
+		checkOpaqueNode(opaqueDirectory, true);
+		Path temporary = Files.createTempFile(opaqueDirectory, ".probe-", ".tmp",
+				PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+		try {
+			Files.writeString(temporary, content);
+			Files.move(temporary, opaqueDirectory.resolve(name), StandardCopyOption.ATOMIC_MOVE);
+		} finally {
+			Files.deleteIfExists(temporary);
 		}
 	}
 
@@ -387,17 +521,40 @@ public final class FabricPrototypeBootProbe {
 					fail("saved-world-witness-missing");
 					return;
 				}
-				if (outcome.compareAndSet(Outcome.RUNNING, Outcome.PASSED)) {
-					deadline.shutdownNow();
-					LOGGER.info("LOADONCE_PROTOTYPE_PASSED phase=world-reloaded menuFrames={} inputEvidence={}"
-							+ " worldFrames={} reloadFrames={} reloadPassed=true persistedBlock=true elapsedMs={}",
-							menuFrames, menuInputVerified && worldInputVerified, worldFrames, reloadedFrames, elapsedMillis());
-				}
+				pass(client);
 			}
 		} catch (IOException failure) {
 			fail("evidence-write-" + failure.getClass().getSimpleName());
 		} catch (Exception failure) {
 			fail("readback-" + failure.getClass().getSimpleName());
+		}
+	}
+
+	private synchronized void pass(Minecraft client) throws IOException {
+		if (outcome.get() != Outcome.RUNNING) {
+			return;
+		}
+		if (opaqueDirectory != null) {
+			if (!opaqueReleased || opaqueGeneration == null || !opaqueGeneration.matches("[1-3]")
+					|| instance != this || initializations != 1 || client != retainedClient
+					|| client.gameRenderer != retainedRenderer || client.getWindow() != retainedWindow
+					|| client.getWindow().handle() != retainedWindowHandle
+					|| !menuInputVerified || !worldInputVerified) {
+				throw new IOException("Opaque full acceptance lost its retained generation or application identities");
+			}
+			Path passed = opaqueDirectory.resolve("probe-passed-" + opaqueGeneration + ".properties");
+			if (Files.exists(passed, LinkOption.NOFOLLOW_LINKS)) {
+				throw new IOException("Opaque generation already has acceptance evidence: " + passed);
+			}
+			writeOpaqueFile(passed.getFileName().toString(), "generation=" + opaqueGeneration + "\n" + opaqueEvidence(client)
+					+ "menu_frames=" + menuFrames + "\nworld_frames=" + worldFrames + "\nreload_frames=" + reloadedFrames
+					+ "\ninput_verified=true\nreload_passed=true\npersisted_block=true\n");
+		}
+		if (outcome.compareAndSet(Outcome.RUNNING, Outcome.PASSED)) {
+			deadline.shutdownNow();
+			LOGGER.info("LOADONCE_PROTOTYPE_PASSED phase=world-reloaded menuFrames={} inputEvidence={}"
+					+ " worldFrames={} reloadFrames={} reloadPassed=true persistedBlock=true elapsedMs={}",
+					menuFrames, menuInputVerified && worldInputVerified, worldFrames, reloadedFrames, elapsedMillis());
 		}
 	}
 
@@ -425,7 +582,7 @@ public final class FabricPrototypeBootProbe {
 		client.stop();
 	}
 
-	private void fail(String reason) {
+	private synchronized void fail(String reason) {
 		if (outcome.compareAndSet(Outcome.RUNNING, Outcome.FAILED)) {
 			deadline.shutdownNow();
 			LOGGER.error("LOADONCE_PROTOTYPE_FAILED phase={} reason={} menuFrames={} worldFrames={} elapsedMs={} {}",
