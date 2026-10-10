@@ -1,0 +1,43 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'io.loadonce'
+version = '0.1.0-poc'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+sourceSets {
+    verification {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    archiveFileName = 'loadonce-runtime.jar'
+    manifest {
+        attributes(
+            'Premain-Class': 'io.loadonce.runtime.LoadOnceAgent',
+            'Main-Class': 'io.loadonce.runtime.demo.RuntimeDemo',
+            'Can-Redefine-Classes': 'false',
+            'Can-Retransform-Classes': 'false'
+        )
+    }
+}
+
+tasks.register('verifyRuntime', JavaExec) {
+    dependsOn verificationClasses
+    classpath = sourceSets.verification.runtimeClasspath
+    mainClass = 'io.loadonce.runtime.RuntimeChecks'
+}
+
+check.dependsOn verifyRuntime

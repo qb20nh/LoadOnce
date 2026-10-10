@@ -1,31 +1,26 @@
 {
 	"schemaVersion": 1,
-	"id": "modid",
+	"id": "loadonce",
 	"version": "${version}",
-	"name": "Example Mod",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "LoadOnce",
+	"description": "Experimental Stage 1 startup-readiness probe for the LoadOnce JVM runtime. Minecraft initialization and client graphics are recreated normally; this adapter does not checkpoint Minecraft.",
 	"authors": [
-		"Me!"
+		"LoadOnce contributors"
 	],
-	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
-	},
 	"license": "CC0-1.0",
-	"icon": "assets/modid/icon.png",
+	"icon": "assets/loadonce/icon.png",
 	"environment": "*",
 	"entrypoints": {
 		"main": [
-			"com.example.ExampleMod"
+			"io.loadonce.fabric.LoadOnceMod"
 		],
 		"client": [
-			"com.example.client.ExampleModClient"
+			"io.loadonce.fabric.client.LoadOnceClient"
 		]
 	},
 	"mixins": [
-		"modid.mixins.json",
 		{
-			"config": "modid.client.mixins.json",
+			"config": "loadonce.client.mixins.json",
 			"environment": "client"
 		}
 	],

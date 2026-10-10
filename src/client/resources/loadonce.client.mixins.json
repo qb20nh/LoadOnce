@@ -1,0 +1,12 @@
+{
+    "required": true,
+    "package": "io.loadonce.fabric.client.mixin",
+    "compatibilityLevel": "JAVA_25",
+    "client": [
+        "TitleScreenAccessor",
+        "MinecraftReadinessMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

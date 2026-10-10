@@ -15,7 +15,7 @@ loom {
 	splitEnvironmentSourceSets()
 
 	mods {
-		"modid" {
+		"loadonce" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
@@ -23,6 +23,7 @@ loom {
 }
 
 dependencies {
+	include implementation(project(':poc-runtime'))
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"

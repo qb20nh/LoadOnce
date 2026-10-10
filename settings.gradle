@@ -10,4 +10,10 @@ pluginManagement {
 }
 
 // Should match your modid
-rootProject.name = 'modid'
+rootProject.name = 'loadonce'
+
+include 'poc-runtime'
+project(':poc-runtime').projectDir = file('poc/runtime')
+
+include 'poc-native'
+project(':poc-native').projectDir = file('poc/native')

@@ -38,3 +38,10 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# Local launch caches and Python checks
+.loadonce-cache/
+.loadonce-leyden-cache/
+.loadonce-images/
+.loadonce-checkpoints/
+__pycache__/

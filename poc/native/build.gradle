@@ -1,0 +1,71 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'io.loadonce'
+version = '0.1.0-poc'
+
+repositories { mavenCentral() }
+
+// Match the LWJGL version in the current Minecraft metadata. Only Linux x64 is audited here.
+def lwjglVersion = '3.4.3'
+dependencies {
+    implementation project(':poc-runtime')
+    ['lwjgl', 'lwjgl-glfw', 'lwjgl-opengl', 'lwjgl-openal'].each { module ->
+        implementation "org.lwjgl:${module}:${lwjglVersion}"
+        runtimeOnly "org.lwjgl:${module}:${lwjglVersion}:natives-linux"
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+sourceSets {
+    verification {
+        compileClasspath += sourceSets.main.output + configurations.runtimeClasspath
+        runtimeClasspath += sourceSets.main.output + configurations.runtimeClasspath
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+tasks.register('verifyNativeInvariants', JavaExec) {
+    dependsOn verificationClasses
+    classpath = sourceSets.verification.runtimeClasspath
+    mainClass = 'io.loadonce.nativepoc.NativeInvariantChecks'
+}
+
+tasks.register('verifyNative', JavaExec) {
+    dependsOn classes
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'io.loadonce.nativepoc.NativeFixture'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    args '--cycles', providers.gradleProperty('nativeCycles').getOrElse('20')
+    environment 'ALSOFT_DRIVERS', 'null'
+    environment 'ALSOFT_LOGLEVEL', '0'
+}
+
+tasks.register('nativeClasspath') {
+    dependsOn classes
+    def runtimeFiles = sourceSets.main.runtimeClasspath
+    doLast { println runtimeFiles.asPath }
+}
+
+tasks.register('writeClasspath') {
+    dependsOn classes
+    def destination = layout.buildDirectory.file('runtime-classpath.txt')
+    def runtimeFiles = sourceSets.main.runtimeClasspath
+    inputs.files(runtimeFiles)
+    outputs.file(destination)
+    doLast {
+        destination.get().asFile.text = runtimeFiles.asPath + '\n'
+        println "Native fixture classpath: ${destination.get().asFile}"
+    }
+}
+
+check.dependsOn verifyNativeInvariants
