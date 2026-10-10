@@ -87,7 +87,16 @@ Run real isolated image checks with a verified CRaC JDK:
 ./gradlew cracIntegrationSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java
 ```
 
-The Java harness verifies real callbacks, descriptor rejection, capture and three distinct process restores, retained heap/PID evidence, compatibility/corruption fallback and failed restore without replay. `-PloadonceCracEngine=simengine` checks callbacks and explicitly claims no image; `criuengine` requires suitable kernel capabilities. Warp has passed without elevated capabilities on the selected host.
+The Java harness verifies real callbacks, descriptor rejection, capture and three distinct process restores, retained heap/PID evidence, compatibility/corruption fallback and failed restore without replay. `-PloadonceCracEngine=simengine` checks callbacks and explicitly claims no image; `criuengine` requires suitable kernel capabilities. Warp passed on the recorded cloud host but crashed during restoration on the local Linux host; engine compatibility must be verified locally.
+
+For an experimental CPU-only check with installed upstream CRIU and a compatible Azul CRaC JDK:
+
+```sh
+./gradlew criuNamespaceSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java \
+  -PloadonceCriu=/usr/bin/criu
+```
+
+This opt-in task requires Linux `unshare`, `ip`, `setsid`, CRIU and enabled unprivileged user namespaces. It creates private user/PID/network/IPC/UTS/cgroup/mount namespaces, enables only their loopback, disables CDS and uses Azul's explicitly unsupported `upstream_criu=true` option. It verifies one substantial CPU snapshot and three separate namespace restores, retained heap state and exact lifecycle callbacks, with runtime/provider/image hashes and private evidence under `build/criu-namespace-validation/`. Restored namespace-visible PIDs may match the source; distinct host controllers prove separate launches. A failed restore stops the test without cold fallback or replay. This does not enable production or Minecraft image reuse.
 
 For explicit CPU fixture capture/run:
 
@@ -119,6 +128,16 @@ The Java display harness creates an authenticated temporary Xvfb display and bou
 
 All default runs use ten cycles and in-memory OpenAL loopback. The invalid-shader task succeeds only when the child fails with coordinator `STOPPED` and releases every tracked handle. Use `-PloadonceXvfb=/path/to/Xvfb` for an extracted binary. With an existing display, `./gradlew nativeRestorationProbe -PloadonceAudioLoopback=true` remains available.
 
+On a Linux desktop, the same bounded harness can use the current GPU and audio server:
+
+```sh
+./gradlew nativeDisplaySmoke -PloadonceDesktop=true -PloadonceReconfigure=true
+./gradlew nativeDisplaySmoke -PloadonceDesktop=true -PloadonceSystemAudio=true -PloadonceReconfigure=true
+./gradlew nativeDisplaySmoke -PloadonceDesktop=true -PloadonceReconfigure=true -PloadonceInvalidShader=true
+```
+
+Run from the authorized desktop session with `DISPLAY` or `WAYLAND_DISPLAY`, its `XAUTHORITY` when required, and `XDG_RUNTIME_DIR`. Desktop mode needs no Xvfb and does not force software rendering. Only display endpoint variables are forwarded; system-audio mode additionally forwards PulseAudio/PipeWire endpoint and cookie-file references. HOME, temporary files and Mesa cache remain private, and inherited JVM/native injection is excluded. Loopback remains the default; system audio opens the default device and verifies source reconstruction but does not measure physical playback. These runs reconstruct resources in one process; they do not verify a checkpoint image or Minecraft's SDL/Vulkan resources.
+
 To verify a native process image while keeping its authenticated display alive, build the Java harness classpath and launch it directly:
 
 ```sh
@@ -130,7 +149,7 @@ java -cp "$(cat build/launcher-test-classpath.txt)" com.qb20nh.loadonce.launcher
   --native-reconfigure
 ```
 
-For persistent native fixture capture/run, use that native classpath plus `--native --reconfigure` and repeated `--input` provider paths. Keep the same display/authentication alive for all launches; changing Xauthority selects cold startup. Software rendering and explicit null hardware audio avoid OpenAL's unused library-global PulseAudio dispatcher while loopback still renders real PCM. Production PulseAudio shutdown and hardware GPU/audio reconstruction need separate work.
+For persistent native fixture capture/run, use that native classpath plus `--native --reconfigure` and repeated `--input` provider paths. Keep the same display/authentication alive for all launches; changing Xauthority selects cold startup. Software rendering and explicit null hardware audio avoid OpenAL's unused library-global PulseAudio dispatcher while loopback still renders real PCM. Production PulseAudio shutdown and hardware GPU/audio process-image restoration need separate work.
 
 ## Minecraft rendered-menu diagnostic
 

@@ -66,6 +66,14 @@ Use the real JDK's required Java version. Changing the path does not make an inc
 
 The configured agent is injected once; an existing JVM argument referring to the installed agent is retained. Restore selection and launcher-session reconstruction remain disabled.
 
+On Linux, test the installed Prism bootstrap JARs through a private wrapper runtime:
+
+```sh
+./gradlew prismLauncherSmoke -PloadoncePrismDir=/usr/share/PrismLauncher
+```
+
+This opt-in check compares real `JavaCheck.jar` output with direct Java and runs a harmless fixture through `NewLaunch.jar`'s stdin protocol. It verifies literal parameters, JVM properties, cwd, environment, abort and cancellation cleanup, and confirms that `train` never creates a cache for these probes or opaque entrypoints. No launcher account, GUI configuration or Minecraft instance is used. It is not an end-to-end launcher UI or game restoration test.
+
 Remove a previous LoadOnce agent option in JVM-option environment variables or an argument file when selecting the wrapper. These opaque sources are forwarded unchanged and are not inspected for duplicate agents.
 
 ## Leyden and restoration boundaries

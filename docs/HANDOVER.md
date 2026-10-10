@@ -209,7 +209,7 @@ Real JDK 25 AOT checks passed training, linked-cache mapping, failed training pr
 
 ### CRaC
 
-Actual Azul CRaC JDK `25.0.4.1`, build `Zulu25.36+205-CRaC-CA`, passed Warp capture and three independent restores.
+Actual Azul CRaC JDK `25.0.4.1`, build `Zulu25.36+205-CRaC-CA`, passed Warp capture and three independent restores on the recorded cloud host. On the local CachyOS host, capture passed but Warp restoration crashed with exit `139`; the native cause remains unresolved.
 
 Tests verify retained heap state, changed process IDs, lifecycle callbacks, descriptor rejection, compatibility/corruption fallback and failed restoration without replay.
 
@@ -224,6 +224,8 @@ To reproduce CPU integration with a local compatible CRaC JDK:
 
 `simengine` verifies callbacks only; it does not create a real process image.
 
+Local experimental CPU restoration passed with upstream CRIU `4.2.1` in private Linux namespaces: one substantial image, three separate restores, retained heap witness/value `42`, exact callbacks and unchanged runtime/image hashes. To reproduce, run `./gradlew criuNamespaceSmoke -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java`. Azul labels the external `upstream_criu=true` integration unsupported; this optional fixture does not admit Minecraft images. See [current host evidence](prototype-status.md#local-linux-continuation).
+
 ### Graphics/audio and Minecraft
 
 The native fixture passed GLFW window/timer/callback reconstruction, OpenGL readback/rendering and OpenAL playback/PCM reconstruction. Reconfigured settings and failure cleanup passed.
@@ -236,7 +238,9 @@ restorationVerified=false
 checkpointTaken=false
 ```
 
-Actual Prism/Modrinth/CurseForge application integration has not been exercised. Existing evidence covers their relevant command/stream contracts and an external-style executable selection.
+The local NVIDIA desktop passed ten changed-settings native reconstruction cycles with loopback and system audio, plus invalid-shader cleanup. A window-manager resize-ordering bug found on this host was fixed. Minecraft reached its rendered menu through the installed wrapper on NVIDIA OpenGL and analog OpenAL; input and restoration flags remain false. These results do not establish a hardware process image or library-global PulseAudio shutdown.
+
+The installed Prism `11.0.3` JavaCheck/NewLaunch bootstrap JARs passed the new optional `prismLauncherSmoke`: checker parity, real stdin protocol, arguments/properties/environment, abort, cancellation and untouched AOT cache. Launcher GUI/runtime selection and Modrinth/CurseForge applications remain untested.
 
 ## Run the Minecraft menu diagnostic locally
 
@@ -287,17 +291,17 @@ Production Java sources are under `src/main/java/com/qb20nh/loadonce/`, with cli
 
 ## Remaining work
 
-1. Exercise actual external launchers on local Linux and Windows desktops, including probes, stdin, cancellation and launcher runtime selection.
+1. Exercise external-launcher GUI/runtime selection and full game launch on local Linux and Windows desktops. Installed Linux Prism bootstrap probes, stdin and cancellation now have fixture coverage.
 2. Implement Minecraft 26.3 SDL/renderer resource ownership and reconstruction on the correct owner threads. The standalone GLFW fixture does not restore Minecraft's SDL resources.
 3. Establish a credential/session-free checkpoint boundary and reacquire authorized current launcher state after restoration. Keep the unconditional agent veto until this boundary is implemented and verified.
-4. Verify physical GPU/audio devices, PulseAudio shutdown, input and an interactive restored menu.
+4. Verify library-global PulseAudio shutdown, input and an interactive restored menu. Local NVIDIA/system-audio reconstruction and Minecraft cold-menu rendering passed.
 5. Implement Windows ACL-based cache privacy and validation before enabling automatic Windows AOT reuse.
-6. Test CRIU capture and independent restoration on a capable local Linux host.
+6. Resolve bundled CRIU and ordinary-host compatibility; local experimental upstream CRIU CPU capture and three independent namespace restores passed.
 7. Measure startup time and memory after correctness is established; no performance improvement has been demonstrated.
 
 OpenAL's library-global PulseAudio dispatcher retained a pipe after device/context cleanup. Fixture tests use `ALSOFT_DRIVERS=null` with loopback PCM rendering. Production PulseAudio restoration still needs work.
 
-CRIU was blocked in the cloud by kernel permissions/capabilities, seccomp restrictions and TCP-repair failures. No successful CRIU restoration is claimed. HTTP allowlist changes cannot fix those restrictions.
+CRIU was blocked in the cloud by kernel permissions/capabilities, seccomp restrictions and TCP-repair failures. The local experimental namespace fixture does not remove those cloud limits. HTTP allowlist changes cannot fix those restrictions.
 
 Do not replay an application after a restore attempt has started. Do not add descriptor exemptions or close unknown native handles merely to make checkpointing pass.
 

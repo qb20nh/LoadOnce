@@ -259,6 +259,7 @@ public final class NativeRestorationProbe {
             int beforeReturn = sizeEvents;
             glfwSetWindowSize(handle, descriptor.width(), descriptor.height());
             awaitEvents(() -> sizeEvents > beforeReturn, "native callback did not observe restored window dimensions");
+            awaitGeometry(descriptor);
             glfwSwapBuffers(handle);
         }
 
@@ -273,9 +274,9 @@ public final class NativeRestorationProbe {
             int stickyKeys = alternate ? GLFW_TRUE : GLFW_FALSE;
             int stickyMouse = alternate ? GLFW_FALSE : GLFW_TRUE;
             int lockKeyMods = alternate ? GLFW_TRUE : GLFW_FALSE;
+            glfwSetWindowAttrib(handle, GLFW_RESIZABLE, GLFW_TRUE);
             glfwSetWindowSize(handle, width, height);
             glfwSetWindowPos(handle, x, y);
-            glfwSetWindowAttrib(handle, GLFW_RESIZABLE, alternate ? GLFW_TRUE : GLFW_FALSE);
             glfwSetInputMode(handle, GLFW_CURSOR, cursor);
             glfwSetInputMode(handle, GLFW_STICKY_KEYS, stickyKeys);
             glfwSetInputMode(handle, GLFW_STICKY_MOUSE_BUTTONS, stickyMouse);
@@ -284,6 +285,9 @@ public final class NativeRestorationProbe {
             glfwPollEvents();
             WindowDescriptor requested = new WindowDescriptor(width, height, x, y, GLFW_TRUE,
                     alternate ? GLFW_TRUE : GLFW_FALSE, cursor, stickyKeys, stickyMouse, lockKeyMods, false, 10 + cycle * 2.5);
+            // Fixing size limits before the WM applies the resize can lock the previous dimensions.
+            awaitGeometry(requested);
+            glfwSetWindowAttrib(handle, GLFW_RESIZABLE, requested.resizable());
             verifySettings(requested);
             System.out.println("NATIVE_PROBE window-reconfigured cycle=" + cycle + " settings=" + requested);
         }
@@ -305,6 +309,7 @@ public final class NativeRestorationProbe {
         }
 
         private void verifySettings(WindowDescriptor expected) {
+            awaitGeometry(expected);
             WindowDescriptor actual = snapshot();
             require(actual.elapsedTime() >= expected.elapsedTime(), "GLFW elapsed timer regressed across restoration");
             require(actual.width() == expected.width() && actual.height() == expected.height(), "window dimensions differ: " + actual);
@@ -313,6 +318,15 @@ public final class NativeRestorationProbe {
             require(actual.cursor() == expected.cursor() && actual.stickyKeys() == expected.stickyKeys()
                     && actual.stickyMouse() == expected.stickyMouse() && actual.lockKeyMods() == expected.lockKeyMods(), "window input modes differ: " + actual);
             require(actual.closeRequested() == expected.closeRequested(), "window close state differs");
+        }
+
+        private void awaitGeometry(WindowDescriptor expected) {
+            // Desktop window managers acknowledge size and position requests asynchronously.
+            awaitEvents(() -> {
+                WindowDescriptor actual = snapshot();
+                return actual.width() == expected.width() && actual.height() == expected.height()
+                        && actual.x() == expected.x() && actual.y() == expected.y();
+            }, "window geometry did not settle to " + expected);
         }
 
         private record WindowDescriptor(int width, int height, int x, int y, int visible, int resizable,

@@ -80,7 +80,8 @@ public final class CracIntegrationSmoke {
         for (int attempt = 1; attempt <= options.restores(); attempt++) {
             CracFixture.Outcome restored = CracFixture.run(selected, cache, options.timeout(), parentEnvironment);
             require(restored.mode().equals("restore") && restored.exitCode() == 0,
-                    "expected successful restore; inspect " + restored.log());
+                    "expected successful " + selected.engine() + " restore, got mode=" + restored.mode()
+                            + " exit=" + restored.exitCode() + "; no replay attempted; inspect " + restored.log());
             require(restored.pid() != captured.pid() && restoredPids.add(restored.pid()),
                     "restore did not launch a distinct fresh JVM");
             verifyRestored(restored, selected.nativeFixture(), captured.pid(), witness);

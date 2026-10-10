@@ -298,6 +298,18 @@ tasks.register('supervisorAotSmoke', JavaExec) {
 			'--redirectors-dir', redirectorDirectory.absolutePath
 }
 
+tasks.register('prismLauncherSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Opt-in forwarding checks against installed Prism bootstrap JARs, without accounts or Minecraft.'
+	dependsOn tasks.named('agentTestClasses'), agentJar, 'launcherJar', nativeRedirectors
+	classpath = sourceSets.agentTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.agent.PrismLauncherSmoke'
+	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--supervisor-jar', tasks.named('launcherJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--redirectors-dir', redirectorDirectory.absolutePath,
+			'--prism-dir', providers.gradleProperty('loadoncePrismDir').getOrElse('/usr/share/PrismLauncher')
+}
+
 // The subprocess harness quotes literal Windows arguments itself. Legacy
 // ProcessBuilder accepts those complete tokens without stripping interior quotes.
 ['agentContractTest', 'agentAotSmoke', 'redirectorSmoke', 'supervisorAotSmoke'].each { taskName ->
@@ -378,15 +390,31 @@ tasks.register('cracIntegrationSmoke', JavaExec) {
 	}
 }
 
+tasks.register('criuNamespaceSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Opt-in CPU image smoke in private Linux namespaces; external upstream CRIU integration is experimental.'
+	dependsOn tasks.named('launcherTestClasses'), tasks.named('runtimeJar')
+	classpath = sourceSets.launcherTest.runtimeClasspath
+	mainClass = 'com.qb20nh.loadonce.launcher.CriuNamespaceSmoke'
+	args '--runtime-jar', tasks.named('runtimeJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath
+	args '--work-directory', layout.buildDirectory.dir('criu-namespace-validation').get().asFile.absolutePath
+	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
+		args '--java', providers.gradleProperty('loadonceCracJava').get()
+	}
+	args '--criu', providers.gradleProperty('loadonceCriu').getOrElse('/usr/bin/criu')
+}
+
 tasks.register('nativeDisplaySmoke', JavaExec) {
 	group = 'verification'
-	description = 'Runs native reconstruction on a private authenticated software display using Java.'
+	description = 'Runs native reconstruction on a private software display or an opt-in Linux desktop.'
 	dependsOn tasks.named('launcherTestClasses'), tasks.named('writeNativeProbeClasspath')
 	classpath = sourceSets.launcherTest.runtimeClasspath
 	mainClass = 'com.qb20nh.loadonce.launcher.NativeDisplaySmoke'
 	if (providers.gradleProperty('loadonceXvfb').isPresent()) {
 		args '--xvfb', providers.gradleProperty('loadonceXvfb').get()
 	}
+	if (providers.gradleProperty('loadonceDesktop').getOrElse('false').toBoolean()) args '--desktop'
+	if (providers.gradleProperty('loadonceSystemAudio').getOrElse('false').toBoolean()) args '--system-audio'
 	args '--cycles', providers.gradleProperty('loadonceCycles').getOrElse('10')
 	if (providers.gradleProperty('loadonceReconfigure').getOrElse('false').toBoolean()) args '--reconfigure'
 	if (providers.gradleProperty('loadonceInvalidShader').getOrElse('false').toBoolean()) args '--invalid-shader'

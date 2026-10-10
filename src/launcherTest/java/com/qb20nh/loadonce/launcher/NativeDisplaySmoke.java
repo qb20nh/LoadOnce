@@ -18,7 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-/** Opt-in native checks on a private authenticated software X11 display. */
+/** Opt-in native checks on a private software display or the caller's Linux desktop. */
 public final class NativeDisplaySmoke {
     private static final Duration COMMAND_TIMEOUT = Duration.ofMinutes(10);
     private static final Duration AUTH_TIMEOUT = Duration.ofSeconds(10);
@@ -38,9 +38,14 @@ public final class NativeDisplaySmoke {
     }
 
     private static int execute(Options options) throws Exception {
+        return execute(options, System.getenv());
+    }
+
+    static int execute(Options options, Map<String, String> parent) throws Exception {
         Path cwd = Path.of("").toAbsolutePath().normalize();
-        Path xvfb = executable(options.xvfb(), cwd);
-        Path xauth = executable("xauth", cwd);
+        if (options.desktop()) validateDesktop(parent, System.getProperty("os.name"));
+        Path xvfb = options.desktop() ? null : executable(options.xvfb(), cwd);
+        Path xauth = options.desktop() ? null : executable("xauth", cwd);
         Path java = Path.of(System.getProperty("java.home"), "bin", "java").toRealPath();
         List<String> command = options.command().isEmpty()
                 ? probeCommand(java, options) : options.command();
@@ -53,24 +58,30 @@ public final class NativeDisplaySmoke {
             throw new IOException("Cannot register native display cleanup");
         }
         try {
-            Map<String, String> environment = environment(session.directory, java);
-            Path authority = LauncherFiles.tempFile(session.directory, "Xauthority-", "");
-            environment.put("XAUTHORITY", authority.toString());
-            byte[] random = new byte[16];
-            new SecureRandom().nextBytes(random);
-            String cookie = HexFormat.of().formatHex(random);
-            Arrays.fill(random, (byte) 0);
-            authorize(session, xauth, authority, ":0", cookie, environment, cwd);
+            Map<String, String> environment = environment(session.directory, java, options, parent);
+            if (options.desktop()) {
+                System.out.println("NATIVE_SMOKE display=host-desktop software-gl=not-forced");
+            } else {
+                Path authority = LauncherFiles.tempFile(session.directory, "Xauthority-", "");
+                environment.put("XAUTHORITY", authority.toString());
+                byte[] random = new byte[16];
+                new SecureRandom().nextBytes(random);
+                String cookie = HexFormat.of().formatHex(random);
+                Arrays.fill(random, (byte) 0);
+                authorize(session, xauth, authority, ":0", cookie, environment, cwd);
 
-            Path displayOutput = LauncherFiles.tempFile(session.directory, "display-", ".txt");
-            Path displayError = LauncherFiles.tempFile(session.directory, "Xvfb-", ".log");
-            session.startDisplay(List.of(xvfb.toString(), "-displayfd", "1", "-screen", "0", "640x480x24",
-                    "-nolisten", "tcp", "-auth", authority.toString(), "-noreset"),
-                    cwd, environment, displayOutput, displayError);
-            String display = waitForDisplay(session.display, displayOutput, displayError);
-            authorize(session, xauth, authority, display, cookie, environment, cwd);
-            environment.put("DISPLAY", display);
-            System.out.println("NATIVE_SMOKE display=" + display + " software-gl=true");
+                Path displayOutput = LauncherFiles.tempFile(session.directory, "display-", ".txt");
+                Path displayError = LauncherFiles.tempFile(session.directory, "Xvfb-", ".log");
+                session.startDisplay(List.of(xvfb.toString(), "-displayfd", "1", "-screen", "0", "640x480x24",
+                        "-nolisten", "tcp", "-auth", authority.toString(), "-noreset"),
+                        cwd, environment, displayOutput, displayError);
+                String display = waitForDisplay(session.display, displayOutput, displayError);
+                authorize(session, xauth, authority, display, cookie, environment, cwd);
+                environment.put("DISPLAY", display);
+                System.out.println("NATIVE_SMOKE display=" + display + " software-gl=true");
+            }
+            System.out.println("NATIVE_SMOKE audio=" + (options.systemAudio() ? "system-default" : "loopback")
+                    + " physical-playback=not-measured");
 
             Path output = LauncherFiles.tempFile(session.directory, "command-", ".log");
             ChildProcess.Result result = session.run(command, cwd, environment, output, COMMAND_TIMEOUT);
@@ -143,21 +154,70 @@ public final class NativeDisplaySmoke {
         throw new IOException("Xvfb did not report a ready display within 10 seconds: " + Files.readString(error));
     }
 
-    private static Map<String, String> environment(Path root, Path java) throws IOException {
+    static Map<String, String> environment(Path root, Path java, Options options, Map<String, String> parent)
+            throws IOException {
         Map<String, String> environment = new LinkedHashMap<>();
         environment.put("PATH", CLEAN_PATH);
         environment.put("HOME", LauncherFiles.privateDirectory(root.resolve("home")).toString());
         environment.put("LANG", "C.UTF-8");
         environment.put("JAVA_HOME", java.getParent().getParent().toString());
         environment.put("TMPDIR", LauncherFiles.privateDirectory(root.resolve("tmp")).toString());
-        environment.put("XDG_RUNTIME_DIR", LauncherFiles.privateDirectory(root.resolve("xdg")).toString());
+        if (options.desktop()) {
+            for (String key : List.of("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR")) {
+                inherit(environment, parent, key);
+            }
+            if (environment.containsKey("DISPLAY") && !environment.containsKey("XAUTHORITY")) {
+                inheritHomeFile(environment, parent, "XAUTHORITY", ".Xauthority");
+            }
+        } else {
+            environment.put("XDG_RUNTIME_DIR", LauncherFiles.privateDirectory(root.resolve("xdg")).toString());
+            environment.put("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
         environment.put("MESA_SHADER_CACHE_DIR", LauncherFiles.privateDirectory(root.resolve("mesa-cache")).toString());
-        environment.put("LIBGL_ALWAYS_SOFTWARE", "1");
-        environment.put("ALSOFT_DRIVERS", "null");
+        if (options.systemAudio()) {
+            for (String key : List.of("PULSE_SERVER", "PULSE_COOKIE", "PIPEWIRE_REMOTE", "PIPEWIRE_RUNTIME_DIR")) {
+                inherit(environment, parent, key);
+            }
+            if (!environment.containsKey("PULSE_COOKIE")) {
+                inheritHomeFile(environment, parent, "PULSE_COOKIE", ".config/pulse/cookie");
+            }
+        } else {
+            environment.put("ALSOFT_DRIVERS", "null");
+        }
         return environment;
     }
 
-    private static List<String> probeCommand(Path java, Options options) throws IOException {
+    private static void inherit(Map<String, String> environment, Map<String, String> parent, String key) {
+        String value = parent.get(key);
+        if (value != null && !value.isBlank()) environment.put(key, value);
+    }
+
+    private static void inheritHomeFile(Map<String, String> environment, Map<String, String> parent,
+                                        String key, String relative) {
+        String home = parent.get("HOME");
+        if (home != null && !home.isBlank()) {
+            Path file = Path.of(home).resolve(relative);
+            if (Files.isRegularFile(file) && Files.isReadable(file)) environment.put(key, file.toString());
+        }
+    }
+
+    static void validateDesktop(Map<String, String> parent, String osName) throws IOException {
+        require("Linux".equals(osName), "--desktop requires Linux; use the private Xvfb mode on this platform");
+        String display = parent.getOrDefault("DISPLAY", "");
+        String wayland = parent.getOrDefault("WAYLAND_DISPLAY", "");
+        require(!display.isBlank() || !wayland.isBlank(),
+                "--desktop requires DISPLAY or WAYLAND_DISPLAY from the current desktop session");
+        String runtime = parent.getOrDefault("XDG_RUNTIME_DIR", "");
+        require(wayland.isBlank() || !runtime.isBlank(),
+                "--desktop with WAYLAND_DISPLAY requires XDG_RUNTIME_DIR from the current desktop session");
+        if (!runtime.isBlank()) {
+            require(Path.of(runtime).isAbsolute() && Files.isDirectory(Path.of(runtime))
+                            && Files.isReadable(Path.of(runtime)),
+                    "--desktop XDG_RUNTIME_DIR must name an existing readable absolute directory");
+        }
+    }
+
+    static List<String> probeCommand(Path java, Options options) throws IOException {
         Path file = options.classpathFile().toAbsolutePath().normalize();
         require(Files.isRegularFile(file) && Files.size(file) <= 1024 * 1024, "native classpath file is missing or too large");
         String classpath = Files.readString(file).strip();
@@ -165,7 +225,8 @@ public final class NativeDisplaySmoke {
                         && classpath.indexOf('\0') < 0, "native classpath file must contain one nonempty classpath");
         List<String> command = new ArrayList<>(List.of(java.toString(), "--enable-native-access=ALL-UNNAMED",
                 "-cp", classpath, "com.qb20nh.loadonce.prototype.NativeRestorationProbe",
-                "--cycles=" + options.cycles(), "--audio-loopback"));
+                "--cycles=" + options.cycles()));
+        if (!options.systemAudio()) command.add("--audio-loopback");
         if (options.reconfigure()) command.add("--reconfigure");
         if (options.invalidShader()) command.add("--invalid-shader-on-restore");
         return List.copyOf(command);
@@ -205,10 +266,12 @@ public final class NativeDisplaySmoke {
 
     private static void usage() {
         System.out.println("Usage: NativeDisplaySmoke [--xvfb PATH] [--classpath-file PATH] [--cycles 1..100]"
-                + " [--reconfigure] [--invalid-shader] [--command COMMAND ARGS...]");
+                + " [--desktop [--system-audio]] [--reconfigure] [--invalid-shader] [--command COMMAND ARGS...]");
+        System.out.println("Default: private Xvfb, software GL, loopback audio. --desktop uses the current Linux desktop;"
+                + " --system-audio opens its default audio device. Physical playback is not measured.");
     }
 
-    private record Options(String xvfb, Path classpathFile, int cycles, boolean reconfigure,
+    record Options(String xvfb, Path classpathFile, int cycles, boolean desktop, boolean systemAudio, boolean reconfigure,
                            boolean invalidShader, List<String> command, boolean help) {
         static Options parse(String[] arguments) throws IOException {
             String xvfb = System.getenv("LOADONCE_XVFB");
@@ -217,11 +280,14 @@ public final class NativeDisplaySmoke {
             int cycles = 10;
             boolean reconfigure = false;
             boolean invalidShader = false;
+            boolean desktop = false;
+            boolean systemAudio = false;
+            boolean explicitXvfb = false;
             List<String> command = List.of();
             for (int index = 0; index < arguments.length; index++) {
                 String argument = arguments[index];
                 if (argument.equals("--help") || argument.equals("-h")) {
-                    return new Options(xvfb, classpath, cycles, reconfigure, invalidShader, command, true);
+                    return new Options(xvfb, classpath, cycles, desktop, systemAudio, reconfigure, invalidShader, command, true);
                 } else if (argument.equals("--command")) {
                     require(index + 1 < arguments.length, "--command requires an executable");
                     command = List.copyOf(Arrays.asList(arguments).subList(index + 1, arguments.length));
@@ -230,6 +296,10 @@ public final class NativeDisplaySmoke {
                     reconfigure = true;
                 } else if (argument.equals("--invalid-shader")) {
                     invalidShader = true;
+                } else if (argument.equals("--desktop")) {
+                    desktop = true;
+                } else if (argument.equals("--system-audio")) {
+                    systemAudio = true;
                 } else if (argument.equals("--xvfb") || argument.equals("--classpath-file") || argument.equals("--cycles")
                         || argument.startsWith("--xvfb=") || argument.startsWith("--classpath-file=")
                         || argument.startsWith("--cycles=")) {
@@ -243,7 +313,10 @@ public final class NativeDisplaySmoke {
                         value = argument.substring(equals + 1);
                     }
                     require(!value.isBlank(), key + " requires a value");
-                    if (key.equals("--xvfb")) xvfb = value;
+                    if (key.equals("--xvfb")) {
+                        xvfb = value;
+                        explicitXvfb = true;
+                    }
                     else if (key.equals("--classpath-file")) classpath = Path.of(value);
                     else {
                         try {
@@ -258,7 +331,9 @@ public final class NativeDisplaySmoke {
             }
             require(cycles >= 1 && cycles <= 100, "cycles must be between 1 and 100");
             require(command.isEmpty() || !invalidShader, "--invalid-shader requires the native probe");
-            return new Options(xvfb, classpath, cycles, reconfigure, invalidShader, command, false);
+            require(!systemAudio || desktop, "--system-audio requires --desktop to access the current audio server");
+            require(!desktop || !explicitXvfb, "--desktop cannot be combined with --xvfb; it uses the current display");
+            return new Options(xvfb, classpath, cycles, desktop, systemAudio, reconfigure, invalidShader, command, false);
         }
     }
 

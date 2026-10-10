@@ -8,6 +8,7 @@ public final class LauncherContractSuite {
         LauncherFilesTest.main(new String[0]);
         AotLauncherTest.main(new String[0]);
         CracFixtureTest.main(new String[0]);
+        NativeDisplaySmokeTest.main(new String[0]);
         System.out.println("Java launcher contract suite passed");
     }
 }
