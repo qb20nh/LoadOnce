@@ -391,7 +391,6 @@ static int redirect_windows(void) {
     free(backend_config);
     free(canonical_backend);
     ExitProcess(exit_code);
-    return 0;
 }
 
 #ifdef LOADONCE_GUI
