@@ -18,6 +18,8 @@ The Linux build passed 718 lifecycle checks, 454 launcher checks and 82 packaged
 
 An actual Minecraft 26.3 development client started through the installed Linux native executable and Java supervisor. It logged the agent through Fabric's system-loader bridge and passed three rendered Vulkan/CPU menu frames at 854×480, pixel hash `c57a1389e45b30`, elapsed 11,171 ms. Logs, runtime and PNG are under `build/menu-probe/agent-redirect-1930547683695446215/`. It reported `inputVerified=false restorationVerified=false checkpointTaken=false`; no game checkpoint was taken. This exercises an external-style Java executable selection, not the Prism/Modrinth/CurseForge applications themselves, and makes no startup-speed claim.
 
+Windows supervisor verification passed with MSVC 19.51 and `/W4 /WX`: 489 native java/javaw checks, 69 packaged-agent checks, direct real AOT mapping, private-cache refusal without replay, and binary Prism stdin preservation. The [hosted Windows job](https://github.com/qb20nh/LoadOnce/actions/runs/38051441397/job/114211214876) verifies the complete native→Java supervisor→backend path. Linux additionally compiles with `_FORTIFY_SOURCE=3` to check hardened libc return-value diagnostics.
+
 ## Java launcher and harnesses
 
 The launcher, image supervisor, contract tests, Leyden smoke, CRaC smoke and authenticated display harness use Java. The former scripting tools and their CI steps have been removed. `build` packages the premain agent JAR, executable Java 17 launcher JAR, standalone checkpoint runtime JAR and Fabric mod JAR. The agent/launcher have no third-party dependencies; native probes use LWJGL and system graphics/audio providers.

@@ -22,7 +22,13 @@ static volatile sig_atomic_t lo_linux_control = -1;
 static void lo_linux_signal(int signal_number) {
     int saved_errno = errno;
     unsigned char byte = (unsigned char) signal_number;
-    if (lo_linux_control >= 0) (void) write((int) lo_linux_control, &byte, 1);
+    if (lo_linux_control >= 0) {
+        ssize_t written;
+        do { written = write((int) lo_linux_control, &byte, 1); } while (written < 0 && errno == EINTR);
+        /* A full nonblocking pipe already has cancellation queued; a closed
+         * pipe means the guardian's exit will be observed by the frontend. */
+        (void) written;
+    }
     errno = saved_errno;
 }
 
