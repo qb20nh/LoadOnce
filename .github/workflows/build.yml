@@ -24,7 +24,9 @@ jobs:
       - name: build
         run: ./gradlew build
       - name: real Leyden smoke
-        run: ./gradlew leydenSmoke
+        run: ./gradlew leydenSmoke agentAotSmoke
+      - name: Linux Java executable redirection
+        run: ./gradlew redirectorSmoke redirectorDistribution
       - name: software graphics and rendered audio smoke
         run: |
           sudo apt-get update
@@ -38,4 +40,26 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Artifacts
-          path: build/libs/
+          path: |
+            build/libs/
+            build/distributions/
+
+  windows-redirectors:
+    runs-on: windows-2025
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: Windows java and javaw forwarding
+        run: .\gradlew.bat --no-daemon agentContractTest agentAotSmoke redirectorSmoke redirectorDistribution
+      - name: capture Windows redirector distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: Windows-Redirectors
+          path: |
+            build/libs/*-agent.jar
+            build/distributions/

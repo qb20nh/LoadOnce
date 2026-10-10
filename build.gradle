@@ -14,6 +14,7 @@ repositories {
 
 // The runtime is shared with the mod; the native probe runs without Minecraft.
 sourceSets {
+	main { java.exclude 'dev/loadonce/agent/**' }
 	contractTest {
 		compileClasspath += sourceSets.main.output
 		runtimeClasspath += sourceSets.main.output
@@ -25,6 +26,10 @@ sourceSets {
 	launcherTest {
 		compileClasspath += files(layout.buildDirectory.dir('classes/standaloneRuntime'))
 		runtimeClasspath += files(layout.buildDirectory.dir('classes/standaloneRuntime'))
+	}
+	agentTest {
+		compileClasspath += files(layout.buildDirectory.dir('classes/standaloneAgent'))
+		runtimeClasspath += files(layout.buildDirectory.dir('classes/standaloneAgent'))
 	}
 }
 
@@ -68,7 +73,7 @@ tasks.register('runtimeContractTest', JavaExec) {
 }
 
 tasks.named('check') {
-	dependsOn tasks.named('runtimeContractTest'), tasks.named('prototypeClasses'), 'launcherContractTest'
+	dependsOn tasks.named('runtimeContractTest'), tasks.named('prototypeClasses'), 'launcherContractTest', 'agentContractTest'
 }
 
 tasks.register('nativeRestorationProbe', JavaExec) {
@@ -129,6 +134,13 @@ tasks.register('cracSmoke', JavaExec) {
 }
 
 tasks.named('runClient', JavaExec) {
+	if (providers.gradleProperty('loadonceClientJava').isPresent()) {
+		executable = providers.gradleProperty('loadonceClientJava').get()
+	}
+	if (providers.gradleProperty('loadonceAgent').getOrElse('false').toBoolean()) {
+		dependsOn 'agentJar'
+		jvmArgs "-javaagent:${layout.buildDirectory.file('libs/modid-' + project.version + '-agent.jar').get().asFile}"
+	}
 	if (providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
 		jvmArgs '-Dloadonce.menuProbe=true', '-Dloadonce.menuProbe.exit=true',
 				"-Dloadonce.menuProbe.frames=${providers.gradleProperty('loadonceMenuFrames').getOrElse('3')}",
@@ -161,6 +173,13 @@ def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) 
 	options.release = 17
 }
 
+def standaloneAgent = tasks.register('compileStandaloneAgent', JavaCompile) {
+	source = fileTree('src/main/java/dev/loadonce/agent') { include '**/*.java' }
+	classpath = files()
+	destinationDirectory = layout.buildDirectory.dir('classes/standaloneAgent')
+	options.release = 17
+}
+
 tasks.register('runtimeJar', Jar) {
 	group = 'build'
 	description = 'Packages the Java 17 checkpoint runtime without Minecraft or Fabric dependencies.'
@@ -177,8 +196,107 @@ tasks.register('launcherJar', Jar) {
 	archiveClassifier = 'launcher'
 	dependsOn standaloneRuntime
 	from standaloneRuntime.flatMap { it.destinationDirectory }
+	exclude 'dev/loadonce/agent/**'
 	from 'LICENSE'
 	manifest { attributes 'Main-Class': 'dev.loadonce.launcher.LoadOnce' }
+}
+
+def agentJar = tasks.register('agentJar', Jar) {
+	group = 'build'
+	description = 'Packages the Java 17 premain agent for external launchers, without a wrapper JVM.'
+	archiveClassifier = 'agent'
+	dependsOn standaloneAgent
+	from standaloneAgent.flatMap { it.destinationDirectory }
+	from 'LICENSE'
+	manifest {
+		attributes 'Premain-Class': 'dev.loadonce.agent.LoadOnceAgent',
+				'Can-Redefine-Classes': 'false', 'Can-Retransform-Classes': 'false'
+	}
+}
+
+tasks.named('compileAgentTestJava', JavaCompile) {
+	dependsOn standaloneAgent
+	options.release = 17
+}
+
+tasks.register('agentContractTest', JavaExec) {
+	group = 'verification'
+	description = 'Verifies premain in the original application JVM and sanitized agent startup.'
+	dependsOn tasks.named('agentTestClasses'), agentJar
+	classpath = sourceSets.agentTest.runtimeClasspath
+	mainClass = 'dev.loadonce.agent.AgentContractTest'
+	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath
+	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
+		args '--crac-java', providers.gradleProperty('loadonceCracJava').get()
+	}
+}
+
+tasks.register('agentAotSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Verifies direct JVM AOT training and use with the same premain agent.'
+	dependsOn tasks.named('agentTestClasses'), agentJar
+	classpath = sourceSets.agentTest.runtimeClasspath
+	mainClass = 'dev.loadonce.agent.AgentAotSmoke'
+	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath
+}
+
+def redirectorDirectory = layout.buildDirectory.dir('native-redirectors').get().asFile
+def nativeBuildDirectory = layout.buildDirectory.dir('native-redirector-build').get().asFile
+def nativeSourceFile = layout.projectDirectory.file('native/redirector.c').asFile
+def nativeSourceDirectory = layout.projectDirectory.dir('native').asFile
+def nativePlatform = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows') ? 'windows' : 'linux'
+
+def nativeRedirectors = tasks.register('nativeRedirectors', Exec) {
+	group = 'build'
+	description = 'Builds private Java executable forwarding stubs for this host platform.'
+	inputs.file(nativeSourceFile)
+	inputs.file(layout.projectDirectory.file('native/CMakeLists.txt'))
+	outputs.files(new File(redirectorDirectory, nativePlatform == 'windows' ? 'java.exe' : 'java'))
+	if (nativePlatform == 'windows') {
+		outputs.file(new File(redirectorDirectory, 'javaw.exe'))
+		commandLine 'cmake', '--build', nativeBuildDirectory.absolutePath, '--config', 'Release'
+		dependsOn 'configureNativeRedirectors'
+	} else {
+		commandLine 'gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+				nativeSourceFile.absolutePath, '-o', new File(redirectorDirectory, 'java').absolutePath
+		doFirst { redirectorDirectory.mkdirs() }
+	}
+}
+
+tasks.register('configureNativeRedirectors', Exec) {
+	group = 'build'
+	description = 'Configures the Windows console/windowed forwarding executables.'
+	inputs.dir(nativeSourceDirectory)
+	outputs.file(new File(nativeBuildDirectory, 'CMakeCache.txt'))
+	commandLine 'cmake', '-S', nativeSourceDirectory.absolutePath, '-B', nativeBuildDirectory.absolutePath,
+			"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${redirectorDirectory.absolutePath}",
+			"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${redirectorDirectory.absolutePath}"
+}
+
+tasks.register('redirectorSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Verifies native forwarding, launcher probes, arguments and cancellation on this platform.'
+	dependsOn tasks.named('agentTestClasses'), agentJar, nativeRedirectors
+	classpath = sourceSets.agentTest.runtimeClasspath
+	mainClass = 'dev.loadonce.agent.RuntimeRedirectTest'
+	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--redirectors-dir', redirectorDirectory.absolutePath
+}
+
+tasks.register('redirectorDistribution', Zip) {
+	group = 'distribution'
+	description = 'Packages the agent and host-native redirectors for one-time installation.'
+	dependsOn agentJar, nativeRedirectors
+	archiveClassifier = "redirector-${nativePlatform}"
+	destinationDirectory = layout.buildDirectory.dir('distributions')
+	from(agentJar.flatMap { it.archiveFile })
+	from(redirectorDirectory) {
+		include 'java', 'java.exe', 'javaw.exe'
+		into 'redirectors'
+		filePermissions { unix('rwxr-xr-x') }
+	}
+	from 'LICENSE'
+	from('docs/external-launchers.md') { rename { 'INSTALL.md' } }
 }
 
 tasks.named('compileLauncherTestJava', JavaCompile) {
@@ -251,7 +369,7 @@ tasks.register('nativeDisplaySmoke', JavaExec) {
 }
 
 tasks.named('build') {
-	dependsOn tasks.named('runtimeJar'), tasks.named('launcherJar')
+	dependsOn tasks.named('runtimeJar'), tasks.named('launcherJar'), agentJar
 }
 
 java {
@@ -262,6 +380,10 @@ java {
 
 	sourceCompatibility = JavaVersion.VERSION_25
 	targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.named('sourcesJar') {
+	from('src/main/java') { include 'dev/loadonce/agent/**' }
 }
 
 jar {

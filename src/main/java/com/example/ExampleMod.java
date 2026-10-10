@@ -1,5 +1,6 @@
 package com.example;
 
+import dev.loadonce.target.fabric.FabricAgentIntegration;
 import net.fabricmc.api.ModInitializer;
 
 import net.minecraft.resources.Identifier;
@@ -21,7 +22,7 @@ public class ExampleMod implements ModInitializer {
 		// However, some things (like resources) may still be uninitialized.
 		// Proceed with mild caution.
 
-		LOGGER.info("Hello Fabric world!");
+		FabricAgentIntegration.initialize();
 	}
 
 	public static Identifier id(String path) {

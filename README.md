@@ -1,8 +1,29 @@
 # LoadOnce
 
-LoadOnce uses Java JARs to reuse JVM initialization and reconstruct external resources. It contains a standalone Java/javaw launcher, a loader-independent checkpoint lifecycle library, a Fabric 26.3 mod target, and real GLFW/OpenGL/OpenAL restoration probes. Application code, launcher tools and integration harnesses use Java; no Python or project shell helper is required.
+LoadOnce prototypes JVM initialization reuse and native resource reconstruction. Prism, Modrinth, CurseForge and the vanilla launcher can keep control of Java: LoadOnce loads through an in-process Java agent and, for Fabric 26.3, the mod JAR. A private native `java`/`javaw` redirector can inject the agent when selecting a custom Java executable. The separate launcher JAR remains an optional tool for isolated cache/image experiments.
 
-The launcher selects Leyden or CRaC startup flags before starting the application. Mod hooks own the resource lifecycle inside the running game. An agent attached after startup cannot supply JVM startup flags retroactively. The current Minecraft integration observes conventional startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented.
+External launchers select JVM startup flags; mod hooks own game resource integration. The agent installs early checkpoint protection and reports fixed capability identifiers without reading or logging game arguments. The current Minecraft integration observes conventional startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented. No Python is required.
+
+## External launchers
+
+Put `modid-1.0.0.jar` and Fabric API in the instance's mods directory, then add this JVM argument in your launcher:
+
+```text
+-javaagent:/absolute/path/modid-1.0.0-agent.jar
+```
+
+The agent runs in that launcher's JVM, preserves its main class and authentication flow, and needs no extra Java process. An unmodified vanilla profile can load the agent; the game hooks require a Fabric profile matching Minecraft 26.3. The current agent denies CRaC checkpoints because the game resource/session boundary is not implemented. It does not automatically train, select or restore caches.
+
+For automatic injection through a custom Java executable, build the native redirector for your platform:
+
+```sh
+./gradlew redirectorDistribution redirectorSmoke agentAotSmoke
+java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller \
+  --java-home /path/to/real/jdk --redirectors-dir build/native-redirectors \
+  --agent-jar build/libs/modid-1.0.0-agent.jar --output-dir /path/to/new/loadonce-runtime
+```
+
+Select the new runtime's `bin/java` on Linux or `bin/java.exe`/`bin/javaw.exe` on Windows. The installer leaves the real JDK intact. The native executable forwards the original arguments and adds the Java agent; Linux preserves the process PID and Windows owns the forwarded JVM through a job object. These executables contain only forwarding code; LoadOnce logic and tests use Java. See [external-launcher setup and limits](docs/external-launchers.md).
 
 ## Build and Java checks
 
@@ -13,15 +34,16 @@ Use JDK 25 to build the Minecraft target and run the native tests:
 ./gradlew leydenSmoke
 ```
 
-`build` compiles both mod source sets, runs the lifecycle and Java launcher contracts, and creates three artifacts under `build/libs/`:
+`build` compiles both mod source sets, runs lifecycle/launcher/agent contracts, and creates four artifacts under `build/libs/`:
 
 - `modid-1.0.0.jar`: Fabric mod with opt-in client observation hooks.
 - `modid-1.0.0-runtime.jar`: checkpoint lifecycle library without Minecraft/Fabric dependencies.
+- `modid-1.0.0-agent.jar`: Java 17 premain agent and one-time redirector installer.
 - `modid-1.0.0-launcher.jar`: executable Java 17 launcher and lifecycle library, with no third-party dependencies.
 
 In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate.sh` to select the retained JDK and Gradle cache. The launcher's code targets Java 17; Leyden training requires a supporting JVM, and CRaC requires a CRaC-enabled JVM. The current cache/image privacy implementation requires POSIX ownership and permissions. Unsupported cache platforms select an ordinary application launch; Windows/javaw cache behavior has not been verified.
 
-## Java/javaw launcher and Leyden
+## Optional standalone launcher and Leyden
 
 Probe the selected JVM rather than assuming its version provides CRaC or Leyden:
 
