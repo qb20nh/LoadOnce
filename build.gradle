@@ -4,11 +4,24 @@ plugins {
 }
 
 repositories {
+	mavenCentral()
 	// Add repositories to retrieve artifacts from in here.
 	// You should only use this when depending on other mods because
 	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
 	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
 	// for more information about repositories.
+}
+
+// The runtime is shared with the mod; the native probe runs without Minecraft.
+sourceSets {
+	contractTest {
+		compileClasspath += sourceSets.main.output
+		runtimeClasspath += sourceSets.main.output
+	}
+	prototype {
+		compileClasspath += sourceSets.main.output
+		runtimeClasspath += sourceSets.main.output
+	}
 }
 
 loom {
@@ -29,6 +42,58 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	['lwjgl', 'lwjgl-glfw', 'lwjgl-opengl', 'lwjgl-openal'].each { module ->
+		prototypeImplementation "org.lwjgl:${module}:3.4.3"
+		prototypeRuntimeOnly "org.lwjgl:${module}:3.4.3:natives-linux"
+	}
+}
+
+tasks.register('runtimeContractTest', JavaExec) {
+	group = 'verification'
+	description = 'Exercises checkpoint ordering, rollback, failure and thread contracts.'
+	classpath = sourceSets.contractTest.runtimeClasspath
+	mainClass = 'dev.loadonce.runtime.RuntimeContractTest'
+}
+
+tasks.named('check') {
+	dependsOn tasks.named('runtimeContractTest'), tasks.named('prototypeClasses')
+}
+
+tasks.register('nativeRestorationProbe', JavaExec) {
+	group = 'verification'
+	description = 'Recreates real GLFW, OpenGL and OpenAL resources; requires a display and audio backend.'
+	classpath = sourceSets.prototype.runtimeClasspath
+	mainClass = 'dev.loadonce.prototype.NativeRestorationProbe'
+	jvmArgs '--enable-native-access=ALL-UNNAMED'
+	args "--cycles=${providers.gradleProperty('loadonceCycles').getOrElse('3')}"
+	if (providers.gradleProperty('loadonceUseCrac').getOrElse('false').toBoolean()) {
+		args '--crac'
+	}
+	if (providers.gradleProperty('loadonceInvalidShader').getOrElse('false').toBoolean()) {
+		args '--invalid-shader-on-restore'
+	}
+	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
+		executable = providers.gradleProperty('loadonceCracJava').get()
+	}
+	if (providers.gradleProperty('loadonceCracEngine').isPresent()) {
+		jvmArgs "-XX:CRaCEngine=${providers.gradleProperty('loadonceCracEngine').get()}",
+				"-XX:CRaCCheckpointTo=${layout.buildDirectory.dir('crac-probe').get().asFile}"
+	}
+}
+
+tasks.register('cracSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Invokes the real optional jdk.crac API on an isolated CPU-only probe.'
+	classpath = sourceSets.main.output
+	mainClass = 'dev.loadonce.runtime.CracSmoke'
+	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
+		executable = providers.gradleProperty('loadonceCracJava').get()
+	}
+	if (providers.gradleProperty('loadonceCracEngine').isPresent()) {
+		jvmArgs "-XX:CRaCEngine=${providers.gradleProperty('loadonceCracEngine').get()}",
+				"-XX:CRaCCheckpointTo=${layout.buildDirectory.dir('crac-smoke').get().asFile}"
+	}
 }
 
 processResources {
@@ -42,6 +107,26 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
+}
+
+def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) {
+	source = fileTree('src/main/java/dev/loadonce/runtime') { include '**/*.java' }
+	classpath = files()
+	destinationDirectory = layout.buildDirectory.dir('classes/standaloneRuntime')
+	options.release = 17
+}
+
+tasks.register('runtimeJar', Jar) {
+	group = 'build'
+	description = 'Packages the Java 17 checkpoint runtime without Minecraft or Fabric dependencies.'
+	archiveClassifier = 'runtime'
+	dependsOn standaloneRuntime
+	from standaloneRuntime.flatMap { it.destinationDirectory }
+	from 'LICENSE'
+}
+
+tasks.named('build') {
+	dependsOn tasks.named('runtimeJar')
 }
 
 java {
