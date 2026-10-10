@@ -2,7 +2,7 @@
 
 LoadOnce prototypes JVM initialization reuse and native resource reconstruction. Prism, Modrinth, CurseForge and the vanilla launcher can select a private `java`/`javaw` executable that starts a Java supervisor, applies startup policy, then runs their original game command with the LoadOnce agent. The Fabric 26.3 mod provides game hooks. Normal launches require no manually invoked JAR launcher and no Python.
 
-The supervisor supplies startup flags before the game JVM starts; mod hooks own game resource integration. The agent protects both JVMs from premature checkpoints. The current Minecraft integration observes ordinary startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented.
+The supervisor supplies startup flags before the game JVM starts; mod hooks own game resource integration. The agent protects both JVMs from premature checkpoints. An opt-in Linux prototype checkpoints a JVM before Fabric, mods or game code execute, then initializes the game and its native resources freshly on cold and restored launches. It does not snapshot an initialized menu or implement Minecraft SDL restoration.
 
 The Fabric mod ID is `loadonce`, its display name is `LoadOnce`, and its Maven group is `com.qb20nh.loadonce`. For local continuation, see the [development handover](docs/HANDOVER.md).
 
@@ -163,6 +163,36 @@ The Fabric diagnostic is disabled by default. On a configured display:
 It requires a loaded `TitleScreen`, opaque active widgets, no overlay/world/connection, three extracted and successfully presented frames, and completed nonuniform GPU readback. Optional PNGs go inside the selected game directory's `loadonce-menu-probe/`. A fresh test directory needs the ordinary `onboardAccessibility:false` option to skip first-run onboarding.
 
 Require `LOADONCE_MENU_PROBE_PASSED` and no `LOADONCE_MENU_PROBE_FAILED`; failure can also stop the game cleanly with exit 0. Keep an outer process deadline for native hangs. The selected software Vulkan client reached the rendered menu. Human input, authentication readiness, physical audio and SDL restoration remain unverified; no Minecraft checkpoint was taken.
+
+## Linux Minecraft checkpoint prototype
+
+The separate `MinecraftPrototype` controller caches only the pre-application JVM. `MinecraftPrototypeBootstrap` does not read the current launch request until after restoration; Fabric, all mods, graphics, audio, input and world loading then start normally. Initialized menus and game assets are not cached. This boundary avoids per-mod checkpoint hooks, but arbitrary modpacks are not yet verified and mod bugs can still occur. The ordinary runtime agent still vetoes checkpoints, and the prototype installs a game checkpoint veto before invoking Fabric.
+
+Use a compatible local CRaC JDK and external CRIU on an authorized Linux desktop:
+
+```sh
+./gradlew minecraftPrototypeTrain -PloadonceCracJava=/path/to/crac-jdk/bin/java -PloadonceCriu=/usr/bin/criu
+./gradlew minecraftPrototypeCold -PloadonceCracJava=/path/to/crac-jdk/bin/java -PloadoncePrototypeVerify=true
+./gradlew minecraftPrototypeWarm -PloadonceCracJava=/path/to/crac-jdk/bin/java -PloadoncePrototypeVerify=true
+./gradlew minecraftPrototypeRun -PloadonceCracJava=/path/to/crac-jdk/bin/java
+./gradlew minecraftPrototypeSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java -PloadonceCriu=/usr/bin/criu
+```
+
+`Train` captures without starting Minecraft. `Cold` starts without an image; `Warm` requires a valid image. `Run` selects a valid image or one cold launch during preflight. `Smoke` verifies one cold launch, captures an image and verifies three separate warm launches. Verification exercises menu input and a dedicated test world's create/load/save/reopen flow; require `LOADONCE_PROTOTYPE_PASSED` and the final controller markers, not exit 0 alone. Without verification, the client remains available for manual use.
+
+An optional separate mod JAR demonstrates fresh mod initialization. Prepare the default dedicated profile, copy the fixture into its mods directory, then run smoke:
+
+```sh
+./gradlew minecraftPrototypeFixtureMod writeMinecraftPrototypeSpec
+cp build/minecraft-prototype/loadonce-additional-mod-fixture.jar build/minecraft-prototype/game/mods/
+./gradlew minecraftPrototypeSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java -PloadonceCriu=/usr/bin/criu
+```
+
+On the recorded local NVIDIA/system-audio host, one cold launch and three warm launches passed menu focus/input, world movement, block save and reopen checks with that fixture. Each boot initialized the mod once with a new UUID. See the [run evidence and limits](docs/prototype-status.md#linux-minecraft-early-jvm-prototype).
+
+The default CRaC executable is `build/local-runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64/bin/java`; override it with `loadonceCracJava`. `loadonceCriu`, `loadoncePrototypeGameDir`, `loadoncePrototypeCache` and `loadoncePrototypeTimeout` override the provider, dedicated profile, private cache and 600-second child deadline. The profile defaults to `build/minecraft-prototype/game` and must be fresh or already carry the private `.loadonce-prototype` marker. The generated launch uses an offline test identity, no user account, private HOME/temp directories and private user/PID/network/IPC/UTS/cgroup/mount namespaces with only loopback. It requires Linux `unshare`, `ip`, `setsid`, CRIU and enabled unprivileged user namespaces. Azul's external `upstream_criu=true` integration is unsupported and experimental.
+
+Image validation covers the CRaC runtime, CRIU, controller, kernel/namespace mapping, launch request, classpath/dependencies, mods and display/session endpoint environment including Xauthority bytes. Changed launch/session arguments or those inputs invalidate the image. Current settings and world data are read by the newly initialized game; they are not retained game state. Images and logs remain owner-only under the selected cache. A restore failure after the attempt starts is final and never replays Minecraft. This is an isolated development workflow, not automatic external-launcher integration, an initialized-game image or a demonstrated startup speedup.
 
 See [validation and continuation notes](docs/prototype-status.md) for recorded host evidence and remaining limits.
 

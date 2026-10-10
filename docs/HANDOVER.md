@@ -64,7 +64,7 @@ JVM-option and native-loader environment variables are removed from the supervis
 
 Linux uses a guardian, worker session and subreapers. Windows uses atomic job assignment and explicit handle inheritance. A completion packet releases intentional helpers after normal application exit, including nonzero exits. Native/controller crashes keep cleanup armed.
 
-Both JVMs load the checkpoint guard. The agent has no class transformers and vetoes every checkpoint. No Minecraft image restoration is enabled.
+Both JVMs load the checkpoint guard. The agent has no class transformers and vetoes every checkpoint. Ordinary external-launcher startup does not enable Minecraft image restoration. The separate Linux prototype below admits only a pre-application JVM checkpoint and installs a game veto before Fabric starts.
 
 ### Startup policy
 
@@ -265,6 +265,28 @@ onboardAccessibility:false
 
 Require `LOADONCE_FABRIC_AGENT` and `LOADONCE_MENU_PROBE_PASSED`, with no `LOADONCE_MENU_PROBE_FAILED`. Exit code 0 alone is insufficient. Keep an outer deadline for native hangs.
 
+## Run the isolated Linux Minecraft prototype
+
+`MinecraftPrototype` supervises a CRaC bootstrap image captured before any Fabric, mod or game initialization. After restoration, `MinecraftPrototypeBootstrap` reads the current private launch request and starts Fabric normally. Game/native resources and world state are initialized freshly for both cold and warm launches; initialized menus and assets are not cached. The design needs no per-mod checkpoint adapters; it does not prove arbitrary modpack compatibility, immunity to mod bugs or a performance improvement. Keep the ordinary agent veto enabled.
+
+Use an authorized Linux desktop, compatible CRaC JDK, installed external CRIU and enabled unprivileged namespaces:
+
+```bash
+./gradlew minecraftPrototypeTrain -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java -PloadonceCriu=/usr/bin/criu
+./gradlew minecraftPrototypeCold -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java -PloadoncePrototypeVerify=true
+./gradlew minecraftPrototypeWarm -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java -PloadoncePrototypeVerify=true
+./gradlew minecraftPrototypeRun -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java
+./gradlew minecraftPrototypeSmoke -PloadonceCracJava=/absolute/path/to/crac-jdk/bin/java -PloadonceCriu=/usr/bin/criu
+```
+
+Training captures only the bootstrap. `Warm` refuses an invalid image; `Run` can select one cold launch only before a restore attempt. `Smoke` runs one verified cold boot, trains, then performs three verified restores. Verification checks menu input and the dedicated `LoadOncePrototype` world's create/load/save/reopen flow. Require game PASS and controller boot/restore evidence; failure markers or missing evidence fail even after orderly exit 0. Once restoration is attempted, failure is returned without replay. Manual `Cold`, `Warm` and `Run` launches omit verification by default.
+
+To include a real additional mod in the default profile, run `./gradlew minecraftPrototypeFixtureMod writeMinecraftPrototypeSpec`, copy `build/minecraft-prototype/loadonce-additional-mod-fixture.jar` into `build/minecraft-prototype/game/mods/`, then run smoke. Initialize the marked profile before copying files into it. Repeated local smoke runs completed one cold and three warm boots on NVIDIA OpenGL and system analog OpenAL, with menu focus/input, world movement, block save/reopen and fresh fixture-mod initialization once per boot. The final build and smoke passed after the latest fixes; changed mod content and corrupted images were rejected before restoration, and the original image remained usable afterward. Exact evidence is recorded in [prototype status](prototype-status.md#linux-minecraft-early-jvm-prototype).
+
+The default local JDK path is `build/local-runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64/bin/java`. Configure `loadonceCracJava` and `loadonceCriu` for another installation; `loadoncePrototypeGameDir`, `loadoncePrototypeCache` and `loadoncePrototypeTimeout` configure the dedicated profile, owner-only evidence/cache and child deadline (default 600 seconds). A new profile defaults to `build/minecraft-prototype/game`; the task rejects existing personal game data without its private `.loadonce-prototype` marker. It supplies an offline test identity and creates private HOME/temp and user/PID/network/IPC/UTS/cgroup/mount namespaces with private loopback only. Linux `unshare`, `ip` and `setsid` are required. Azul's external `upstream_criu=true` integration remains unsupported and experimental.
+
+Runtime/provider/controller, kernel/namespace mapping, launch request including session arguments, classpath/dependencies, mods, display/session endpoint environment and Xauthority changes invalidate an image. The newly initialized game reads current settings and persistent world data. Current prototype tasks do not attach an authenticated launcher session or enable the ordinary executable wrapper to restore game images. See [current prototype evidence](prototype-status.md#linux-minecraft-early-jvm-prototype).
+
 ## Source navigation
 
 | Area | Main entry points |
@@ -282,6 +304,7 @@ Require `LOADONCE_FABRIC_AGENT` and `LOADONCE_MENU_PROBE_PASSED`, with no `LOADO
 | Image fixture supervisor | `CracFixture` |
 | Native reconstruction fixture | `NativeRestorationProbe` |
 | Minecraft observation | `FabricMainMenuProbe` |
+| Isolated Minecraft image controller/bootstrap | `MinecraftPrototype`, `MinecraftPrototypeBootstrap` |
 | Native bootstrap/Windows ownership | `native/redirector.c` |
 | Linux guardian | `native/linux_supervisor.h` |
 | Executable contracts | `RuntimeRedirectTest` |
@@ -292,9 +315,9 @@ Production Java sources are under `src/main/java/com/qb20nh/loadonce/`, with cli
 ## Remaining work
 
 1. Exercise external-launcher GUI/runtime selection and full game launch on local Linux and Windows desktops. Installed Linux Prism bootstrap probes, stdin and cancellation now have fixture coverage.
-2. Implement Minecraft 26.3 SDL/renderer resource ownership and reconstruction on the correct owner threads. The standalone GLFW fixture does not restore Minecraft's SDL resources.
-3. Establish a credential/session-free checkpoint boundary and reacquire authorized current launcher state after restoration. Keep the unconditional agent veto until this boundary is implemented and verified.
-4. Verify library-global PulseAudio shutdown, input and an interactive restored menu. Local NVIDIA/system-audio reconstruction and Minecraft cold-menu rendering passed.
+2. Exercise additional mod sets beyond the separate initialization fixture. The isolated early-JVM prototype passed one cold and three warm menu-input/world save/reopen runs on the local NVIDIA/system-audio host; the standalone GLFW fixture remains separate reconstruction evidence.
+3. Integrate authorized current launcher/session state without putting credentials in an image. The early-JVM prototype uses only an offline test profile; keep the ordinary agent veto.
+4. If pursuing initialized-game snapshots, implement Minecraft SDL/renderer ownership, owner-thread reconstruction and library-global PulseAudio shutdown separately. Local NVIDIA/system-audio fixture reconstruction and ordinary Minecraft cold-menu rendering passed.
 5. Implement Windows ACL-based cache privacy and validation before enabling automatic Windows AOT reuse.
 6. Resolve bundled CRIU and ordinary-host compatibility; local experimental upstream CRIU CPU capture and three independent namespace restores passed.
 7. Measure startup time and memory after correctness is established; no performance improvement has been demonstrated.

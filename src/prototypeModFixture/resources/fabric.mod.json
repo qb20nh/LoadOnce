@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "loadonce_additional_mod_fixture",
+  "version": "1.0.0",
+  "name": "LoadOnce Additional Mod Fixture",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.qb20nh.loadonce.fixture.AdditionalModFixture::initialize"]
+  }
+}

@@ -9,6 +9,7 @@ public final class LauncherContractSuite {
         AotLauncherTest.main(new String[0]);
         CracFixtureTest.main(new String[0]);
         NativeDisplaySmokeTest.main(new String[0]);
+        MinecraftPrototypeBootstrapTest.main(new String[0]);
         System.out.println("Java launcher contract suite passed");
     }
 }

@@ -33,12 +33,15 @@ sourceSets {
 	}
 }
 
+def minecraftPrototypeRequested = gradle.startParameter.taskNames.any { it.tokenize(':').last().startsWith('minecraftPrototype') }
+def minecraftPrototypeGame = providers.gradleProperty('loadoncePrototypeGameDir').getOrElse('build/minecraft-prototype/game')
+
 loom {
 	splitEnvironmentSourceSets()
-	if (providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
+	if (minecraftPrototypeRequested || providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
 		runs {
 			client {
-				runDir providers.gradleProperty('loadonceMenuGameDir').getOrElse('build/menu-probe/game')
+				runDir minecraftPrototypeRequested ? minecraftPrototypeGame : providers.gradleProperty('loadonceMenuGameDir').getOrElse('build/menu-probe/game')
 			}
 		}
 	}
@@ -151,6 +154,87 @@ tasks.named('runClient', JavaExec) {
 	}
 }
 
+def minecraftPrototypeSpec = layout.buildDirectory.file('minecraft-prototype/spec.properties')
+tasks.register('writeMinecraftPrototypeSpec') {
+	group = 'verification'
+	description = 'Writes an isolated Fabric launch request for cold and restored prototype boots.'
+	notCompatibleWithConfigurationCache('Reads the configured Loom development launch task')
+	def client = tasks.named('runClient', JavaExec)
+	dependsOn { client.get().taskDependencies.getDependencies(client.get()) }
+	doLast {
+		def game = file(minecraftPrototypeGame).toPath().toAbsolutePath().normalize()
+		def ownerDirectory = java.nio.file.attribute.PosixFilePermissions.fromString('rwx------')
+		def ownerFile = java.nio.file.attribute.PosixFilePermissions.fromString('rw-------')
+		java.nio.file.Files.createDirectories(game)
+		if (java.nio.file.Files.isSymbolicLink(game)) throw new GradleException('Prototype game directory must not be a symbolic link: ' + game)
+		def marker = game.resolve('.loadonce-prototype')
+		if (!java.nio.file.Files.exists(marker)) {
+			// Loom may create its development resources directory before this task.
+			if (java.nio.file.Files.list(game).withCloseable { entries -> entries.anyMatch { it.fileName.toString() != 'resources' } }) {
+				throw new GradleException('Prototype requires a fresh isolated game directory: ' + game)
+			}
+			java.nio.file.Files.setPosixFilePermissions(game, ownerDirectory)
+			java.nio.file.Files.writeString(marker, 'LoadOnce isolated prototype\n')
+			java.nio.file.Files.setPosixFilePermissions(marker, ownerFile)
+			java.nio.file.Files.writeString(game.resolve('options.txt'), 'onboardAccessibility:false\n')
+		} else if (java.nio.file.Files.isSymbolicLink(marker) || !java.nio.file.Files.isRegularFile(marker)
+				|| java.nio.file.Files.readString(marker) != 'LoadOnce isolated prototype\n') {
+			throw new GradleException('Prototype game directory has an invalid marker: ' + marker)
+		}
+		java.nio.file.Files.createDirectories(game.resolve('mods'))
+		def request = new Properties()
+		request.setProperty('main', client.get().mainClass.get())
+		request.setProperty('gameDirectory', game.toString())
+		def jvm = client.get().allJvmArgs.collect { it.toString() }.findAll { option ->
+			if (!option.startsWith('@')) return true
+			def argumentFile = file(option.substring(1))
+			if (argumentFile.canonicalFile != layout.buildDirectory.file('loom-cache/argFiles/runClient').get().asFile.canonicalFile
+					|| argumentFile.readLines().size() != 2 || argumentFile.readLines().first() != '-classpath') {
+				throw new GradleException('Unsupported launch argument file: ' + argumentFile)
+			}
+			// Loom puts only the classpath here; the prototype passes it as literal argv.
+			return false
+		}
+		if (jvm.any { it.startsWith('-javaagent:') || it.startsWith('-agentlib:') || it.startsWith('-XX:CRaC') }) {
+			throw new GradleException('Prototype bootstrap owns checkpoint admission; remove manual agents and CRaC options')
+		}
+		def classpath = client.get().classpath.filter { it.exists() }.files.collect { it.absolutePath }
+		def args = []
+		def original = client.get().args.collect { it.toString() }
+		for (int index = 0; index < original.size(); index++) {
+			if (['--username', '--uuid', '--accessToken', '--gameDir'].contains(original[index])) { index++ }
+			else { args.add(original[index]) }
+		}
+		args.addAll(['--username', 'LoadOnceTest', '--uuid', '00000000000000000000000000000001',
+				'--accessToken', '0', '--gameDir', game.toString()])
+		[jvm: jvm, classpath: classpath, args: args].each { prefix, values ->
+			request.setProperty(prefix + '.count', values.size().toString())
+			values.eachWithIndex { value, index -> request.setProperty(prefix + '.' + index, value) }
+		}
+		def output = minecraftPrototypeSpec.get().asFile.toPath()
+		java.nio.file.Files.createDirectories(output.parent)
+		java.nio.file.Files.newOutputStream(output).withCloseable { request.store(it, 'Isolated offline Minecraft prototype') }
+		java.nio.file.Files.setPosixFilePermissions(output, ownerFile)
+	}
+}
+
+['train', 'cold', 'warm', 'run', 'smoke'].each { action ->
+	tasks.register('minecraftPrototype' + action.capitalize(), JavaExec) {
+		group = 'verification'
+		description = 'Runs the isolated Linux Minecraft prototype: ' + action + '.'
+		dependsOn 'writeMinecraftPrototypeSpec', 'launcherJar'
+		classpath = files(layout.buildDirectory.dir('classes/standaloneRuntime'))
+		mainClass = 'com.qb20nh.loadonce.launcher.MinecraftPrototype'
+		def localCracJava = layout.buildDirectory.file('local-runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64/bin/java').get().asFile.absolutePath
+		args '--action', action, '--java', providers.gradleProperty('loadonceCracJava').getOrElse(localCracJava),
+				'--criu', providers.gradleProperty('loadonceCriu').getOrElse('/usr/bin/criu'),
+				'--spec', minecraftPrototypeSpec.get().asFile.absolutePath,
+				'--cache-dir', file(providers.gradleProperty('loadoncePrototypeCache').getOrElse('build/minecraft-prototype/cache')).absolutePath,
+				'--verify', (action == 'smoke' || providers.gradleProperty('loadoncePrototypeVerify').getOrElse('false').toBoolean()).toString(),
+				'--timeout-seconds', providers.gradleProperty('loadoncePrototypeTimeout').getOrElse('600')
+	}
+}
+
 processResources {
 	def version = project.version
 	inputs.property "version", version
@@ -158,6 +242,22 @@ processResources {
 	filesMatching("fabric.mod.json") {
 		expand "version": version
 	}
+}
+
+def additionalModClasses = layout.buildDirectory.dir('classes/prototypeModFixture')
+tasks.register('compileMinecraftPrototypeFixtureMod', JavaCompile) {
+	source = fileTree('src/prototypeModFixture/java') { include '**/*.java' }
+	classpath = files()
+	destinationDirectory = additionalModClasses
+}
+tasks.register('minecraftPrototypeFixtureMod', Jar) {
+	group = 'verification'
+	description = 'Builds a separate optional mod for observing fresh initialization on cold and warm boots.'
+	dependsOn 'compileMinecraftPrototypeFixtureMod'
+	archiveFileName = 'loadonce-additional-mod-fixture.jar'
+	destinationDirectory = layout.buildDirectory.dir('minecraft-prototype')
+	from additionalModClasses
+	from 'src/prototypeModFixture/resources'
 }
 
 tasks.withType(JavaCompile).configureEach {
