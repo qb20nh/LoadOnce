@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "com.qb20nh.loadonce.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"mixins": [
+		"LoadOnceServerMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

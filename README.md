@@ -4,12 +4,14 @@ LoadOnce prototypes JVM initialization reuse and native resource reconstruction.
 
 The supervisor supplies startup flags before the game JVM starts; mod hooks own game resource integration. The agent protects both JVMs from premature checkpoints. The current Minecraft integration observes ordinary startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented.
 
+The Fabric mod ID is `loadonce`, its display name is `LoadOnce`, and its Maven group is `com.qb20nh.loadonce`. For local continuation, see the [development handover](docs/HANDOVER.md).
+
 ## External launchers
 
-Put `modid-1.0.0.jar` and Fabric API in the instance's mods directory, then add this JVM argument in your launcher:
+Put `loadonce-1.0.0.jar` and Fabric API in the instance's mods directory, then add this JVM argument in your launcher:
 
 ```text
--javaagent:/absolute/path/modid-1.0.0-agent.jar
+-javaagent:/absolute/path/loadonce-1.0.0-agent.jar
 ```
 
 The agent runs in that launcher's JVM, preserves its main class and authentication flow, and needs no extra Java process. An unmodified vanilla profile can load the agent; the game hooks require a Fabric profile matching Minecraft 26.3. The current agent denies CRaC checkpoints because the game resource/session boundary is not implemented. It does not automatically train, select or restore caches.
@@ -18,13 +20,15 @@ For executable integration, build the native wrapper for your platform:
 
 ```sh
 ./gradlew redirectorDistribution redirectorSmoke supervisorAotSmoke
-java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller \
+java -cp build/libs/loadonce-1.0.0-agent.jar com.qb20nh.loadonce.agent.RuntimeRedirectInstaller \
   --java-home /path/to/real/jdk --redirectors-dir build/native-redirectors \
-  --agent-jar build/libs/modid-1.0.0-agent.jar \
-  --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
+  --agent-jar build/libs/loadonce-1.0.0-agent.jar \
+  --supervisor-jar build/libs/loadonce-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
 ```
 
 Select the new runtime's `bin/java` on Linux or `bin/java.exe`/`bin/javaw.exe` on Windows. The installer leaves the real JDK intact. The native executable owns the Java supervisor and its game process; cache policy lives in Java. Anonymous pipes carry the original arguments and environment in memory, while standard streams remain inherited. Default `auto` uses a validated existing AOT cache and otherwise starts normally; training is explicit. See [external-launcher setup and limits](docs/external-launchers.md).
+
+When upgrading from the template artifact names, remove the previous mod JAR before adding `loadonce-1.0.0.jar`. Update manual agent paths, or reinstall the private runtime into a new directory and select its executable; installed runtime paths are absolute.
 
 ## Build and Java checks
 
@@ -37,10 +41,10 @@ Use JDK 25 to build the Minecraft target and run the native tests:
 
 `build` compiles both mod source sets, runs lifecycle/launcher/agent contracts, and creates four artifacts under `build/libs/`:
 
-- `modid-1.0.0.jar`: Fabric mod with opt-in client observation hooks.
-- `modid-1.0.0-runtime.jar`: checkpoint lifecycle library without Minecraft/Fabric dependencies.
-- `modid-1.0.0-agent.jar`: Java 17 premain agent and one-time redirector installer.
-- `modid-1.0.0-launcher.jar`: executable Java 17 launcher and lifecycle library, with no third-party dependencies.
+- `loadonce-1.0.0.jar`: Fabric mod with opt-in client observation hooks.
+- `loadonce-1.0.0-runtime.jar`: checkpoint lifecycle library without Minecraft/Fabric dependencies.
+- `loadonce-1.0.0-agent.jar`: Java 17 premain agent and one-time redirector installer.
+- `loadonce-1.0.0-launcher.jar`: executable Java 17 launcher and lifecycle library, with no third-party dependencies.
 
 In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate.sh` to select the retained JDK and Gradle cache. The supervisor targets Java 17; Leyden training requires a supporting JVM, and CRaC requires a CRaC-enabled JVM. The current cache/image privacy implementation requires POSIX ownership and permissions. Windows wrappers use ordinary startup until cache ACL validation exists.
 
@@ -49,7 +53,7 @@ In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate
 Probe the selected JVM rather than assuming its version provides CRaC or Leyden:
 
 ```sh
-java -jar build/libs/modid-1.0.0-launcher.jar doctor --java /path/to/jdk/bin/java
+java -jar build/libs/loadonce-1.0.0-launcher.jar doctor --java /path/to/jdk/bin/java
 ```
 
 `doctor` also checks CRaC core classes and can run `criu check` with `--criu /path/to/criu`. Capability presence does not prove safe game checkpointing.
@@ -57,10 +61,10 @@ java -jar build/libs/modid-1.0.0-launcher.jar doctor --java /path/to/jdk/bin/jav
 Train once explicitly, then wrap the same original Java command:
 
 ```sh
-java -jar build/libs/modid-1.0.0-launcher.jar train --cache-dir build/aot-cache \
+java -jar build/libs/loadonce-1.0.0-launcher.jar train --cache-dir build/aot-cache \
   --input mods --input config --input resourcepacks -- \
   /path/to/jdk/bin/java -cp application.jar your.MainClass
-java -jar build/libs/modid-1.0.0-launcher.jar run --cache-dir build/aot-cache \
+java -jar build/libs/loadonce-1.0.0-launcher.jar run --cache-dir build/aot-cache \
   --input mods --input config --input resourcepacks -- \
   /path/to/jdk/bin/java -cp application.jar your.MainClass
 ```
@@ -89,10 +93,10 @@ For explicit CPU fixture capture/run:
 
 ```sh
 realpath build/libs/*-runtime.jar > build/crac-fixture-classpath.txt
-java -jar build/libs/modid-1.0.0-launcher.jar fixture-capture \
+java -jar build/libs/loadonce-1.0.0-launcher.jar fixture-capture \
   --java /path/to/crac-jdk/bin/java --cache-dir build/fixture-cache \
   --classpath-file build/crac-fixture-classpath.txt
-java -jar build/libs/modid-1.0.0-launcher.jar fixture-run \
+java -jar build/libs/loadonce-1.0.0-launcher.jar fixture-run \
   --java /path/to/crac-jdk/bin/java --cache-dir build/fixture-cache \
   --classpath-file build/crac-fixture-classpath.txt
 ```
@@ -119,9 +123,9 @@ To verify a native process image while keeping its authenticated display alive, 
 
 ```sh
 ./gradlew writeLauncherTestClasspath writeNativeProbeClasspath
-java -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.NativeDisplaySmoke \
+java -cp "$(cat build/launcher-test-classpath.txt)" com.qb20nh.loadonce.launcher.NativeDisplaySmoke \
   --xvfb /path/to/Xvfb --command /path/to/jdk/bin/java \
-  -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.CracIntegrationSmoke \
+  -cp "$(cat build/launcher-test-classpath.txt)" com.qb20nh.loadonce.launcher.CracIntegrationSmoke \
   --java /path/to/crac-jdk/bin/java --native-classpath-file build/native-probe-classpath.txt \
   --native-reconfigure
 ```

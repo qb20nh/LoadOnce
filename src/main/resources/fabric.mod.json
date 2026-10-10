@@ -1,31 +1,32 @@
 {
 	"schemaVersion": 1,
-	"id": "modid",
+	"id": "loadonce",
 	"version": "${version}",
-	"name": "Example Mod",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "LoadOnce",
+	"description": "Prototypes JVM initialization reuse and native resource reconstruction for Minecraft.",
 	"authors": [
-		"Me!"
+		"qb20nh"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"homepage": "https://github.com/qb20nh/LoadOnce",
+		"sources": "https://github.com/qb20nh/LoadOnce",
+		"issues": "https://github.com/qb20nh/LoadOnce/issues"
 	},
 	"license": "CC0-1.0",
-	"icon": "assets/modid/icon.png",
+	"icon": "assets/loadonce/icon.png",
 	"environment": "*",
 	"entrypoints": {
 		"main": [
-			"com.example.ExampleMod"
+			"com.qb20nh.loadonce.LoadOnceMod"
 		],
 		"client": [
-			"com.example.client.ExampleModClient"
+			"com.qb20nh.loadonce.client.LoadOnceClient"
 		]
 	},
 	"mixins": [
-		"modid.mixins.json",
+		"loadonce.mixins.json",
 		{
-			"config": "modid.client.mixins.json",
+			"config": "loadonce.client.mixins.json",
 			"environment": "client"
 		}
 	],

@@ -14,7 +14,7 @@ repositories {
 
 // The runtime is shared with the mod; the native probe runs without Minecraft.
 sourceSets {
-	main { java.exclude 'dev/loadonce/agent/**', 'dev/loadonce/supervisor/**' }
+	main { java.exclude 'com/qb20nh/loadonce/agent/**', 'com/qb20nh/loadonce/supervisor/**' }
 	contractTest {
 		compileClasspath += sourceSets.main.output
 		runtimeClasspath += sourceSets.main.output
@@ -44,7 +44,7 @@ loom {
 	}
 
 	mods {
-		"modid" {
+		"loadonce" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
@@ -69,7 +69,7 @@ tasks.register('runtimeContractTest', JavaExec) {
 	group = 'verification'
 	description = 'Exercises checkpoint ordering, rollback, failure and thread contracts.'
 	classpath = sourceSets.contractTest.runtimeClasspath
-	mainClass = 'dev.loadonce.runtime.RuntimeContractTest'
+	mainClass = 'com.qb20nh.loadonce.runtime.RuntimeContractTest'
 }
 
 tasks.named('check') {
@@ -80,7 +80,7 @@ tasks.register('nativeRestorationProbe', JavaExec) {
 	group = 'verification'
 	description = 'Recreates real GLFW, OpenGL and OpenAL resources; requires a display and audio backend.'
 	classpath = sourceSets.prototype.runtimeClasspath
-	mainClass = 'dev.loadonce.prototype.NativeRestorationProbe'
+	mainClass = 'com.qb20nh.loadonce.prototype.NativeRestorationProbe'
 	jvmArgs '--enable-native-access=ALL-UNNAMED'
 	args "--cycles=${providers.gradleProperty('loadonceCycles').getOrElse('3')}"
 	if (providers.gradleProperty('loadonceUseCrac').getOrElse('false').toBoolean()) {
@@ -123,7 +123,7 @@ tasks.register('cracSmoke', JavaExec) {
 	group = 'verification'
 	description = 'Invokes the real optional jdk.crac API on an isolated CPU-only probe.'
 	classpath = sourceSets.main.output
-	mainClass = 'dev.loadonce.runtime.CracSmoke'
+	mainClass = 'com.qb20nh.loadonce.runtime.CracSmoke'
 	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
 		executable = providers.gradleProperty('loadonceCracJava').get()
 	}
@@ -139,7 +139,7 @@ tasks.named('runClient', JavaExec) {
 	}
 	if (providers.gradleProperty('loadonceAgent').getOrElse('false').toBoolean()) {
 		dependsOn 'agentJar'
-		jvmArgs "-javaagent:${layout.buildDirectory.file('libs/modid-' + project.version + '-agent.jar').get().asFile}"
+		jvmArgs "-javaagent:${layout.buildDirectory.file('libs/loadonce-' + project.version + '-agent.jar').get().asFile}"
 	}
 	if (providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
 		jvmArgs '-Dloadonce.menuProbe=true', '-Dloadonce.menuProbe.exit=true',
@@ -165,7 +165,7 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) {
-	source = fileTree('src/main/java/dev/loadonce') {
+	source = fileTree('src/main/java/com/qb20nh/loadonce') {
 		include 'runtime/**/*.java', 'launcher/**/*.java', 'supervisor/**/*.java'
 	}
 	classpath = files()
@@ -174,7 +174,7 @@ def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) 
 }
 
 def standaloneAgent = tasks.register('compileStandaloneAgent', JavaCompile) {
-	source = fileTree('src/main/java/dev/loadonce/agent') { include '**/*.java' }
+	source = fileTree('src/main/java/com/qb20nh/loadonce/agent') { include '**/*.java' }
 	classpath = files()
 	destinationDirectory = layout.buildDirectory.dir('classes/standaloneAgent')
 	options.release = 17
@@ -186,7 +186,7 @@ tasks.register('runtimeJar', Jar) {
 	archiveClassifier = 'runtime'
 	dependsOn standaloneRuntime
 	from standaloneRuntime.flatMap { it.destinationDirectory }
-	include 'dev/loadonce/runtime/**', 'LICENSE'
+	include 'com/qb20nh/loadonce/runtime/**', 'LICENSE'
 	from 'LICENSE'
 }
 
@@ -196,9 +196,9 @@ tasks.register('launcherJar', Jar) {
 	archiveClassifier = 'launcher'
 	dependsOn standaloneRuntime
 	from standaloneRuntime.flatMap { it.destinationDirectory }
-	exclude 'dev/loadonce/agent/**'
+	exclude 'com/qb20nh/loadonce/agent/**'
 	from 'LICENSE'
-	manifest { attributes 'Main-Class': 'dev.loadonce.launcher.LoadOnce' }
+	manifest { attributes 'Main-Class': 'com.qb20nh.loadonce.launcher.LoadOnce' }
 }
 
 def agentJar = tasks.register('agentJar', Jar) {
@@ -209,7 +209,7 @@ def agentJar = tasks.register('agentJar', Jar) {
 	from standaloneAgent.flatMap { it.destinationDirectory }
 	from 'LICENSE'
 	manifest {
-		attributes 'Premain-Class': 'dev.loadonce.agent.LoadOnceAgent',
+		attributes 'Premain-Class': 'com.qb20nh.loadonce.agent.LoadOnceAgent',
 				'Can-Redefine-Classes': 'false', 'Can-Retransform-Classes': 'false'
 	}
 }
@@ -224,7 +224,7 @@ tasks.register('agentContractTest', JavaExec) {
 	description = 'Verifies premain in the original application JVM and sanitized agent startup.'
 	dependsOn tasks.named('agentTestClasses'), agentJar
 	classpath = sourceSets.agentTest.runtimeClasspath
-	mainClass = 'dev.loadonce.agent.AgentContractTest'
+	mainClass = 'com.qb20nh.loadonce.agent.AgentContractTest'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath
 	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
 		args '--crac-java', providers.gradleProperty('loadonceCracJava').get()
@@ -236,7 +236,7 @@ tasks.register('agentAotSmoke', JavaExec) {
 	description = 'Verifies direct JVM AOT training and use with the same premain agent.'
 	dependsOn tasks.named('agentTestClasses'), agentJar
 	classpath = sourceSets.agentTest.runtimeClasspath
-	mainClass = 'dev.loadonce.agent.AgentAotSmoke'
+	mainClass = 'com.qb20nh.loadonce.agent.AgentAotSmoke'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath
 }
 
@@ -281,7 +281,7 @@ tasks.register('redirectorSmoke', JavaExec) {
 	description = 'Verifies native forwarding, launcher probes, arguments and cancellation on this platform.'
 	dependsOn tasks.named('agentTestClasses'), agentJar, 'launcherJar', nativeRedirectors
 	classpath = sourceSets.agentTest.runtimeClasspath
-	mainClass = 'dev.loadonce.agent.RuntimeRedirectTest'
+	mainClass = 'com.qb20nh.loadonce.agent.RuntimeRedirectTest'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--supervisor-jar', tasks.named('launcherJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--redirectors-dir', redirectorDirectory.absolutePath
@@ -292,7 +292,7 @@ tasks.register('supervisorAotSmoke', JavaExec) {
 	description = 'Verifies external executable startup policy against real AOT caches and fallback.'
 	dependsOn tasks.named('agentTestClasses'), agentJar, 'launcherJar', nativeRedirectors
 	classpath = sourceSets.agentTest.runtimeClasspath
-	mainClass = 'dev.loadonce.agent.SupervisorAotSmoke'
+	mainClass = 'com.qb20nh.loadonce.agent.SupervisorAotSmoke'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--supervisor-jar', tasks.named('launcherJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--redirectors-dir', redirectorDirectory.absolutePath
@@ -333,7 +333,7 @@ tasks.register('launcherContractTest', JavaExec) {
 	description = 'Exercises Java launcher privacy, fingerprints, fallback and process contracts.'
 	dependsOn tasks.named('launcherTestClasses')
 	classpath = sourceSets.launcherTest.runtimeClasspath
-	mainClass = 'dev.loadonce.launcher.LauncherContractSuite'
+	mainClass = 'com.qb20nh.loadonce.launcher.LauncherContractSuite'
 }
 
 def launcherTestClasspath = sourceSets.launcherTest.runtimeClasspath
@@ -354,7 +354,7 @@ tasks.register('leydenSmoke', JavaExec) {
 	description = 'Verifies real AOT cache training/mapping and one-launch fallback on the selected JDK.'
 	dependsOn tasks.named('launcherTestClasses')
 	classpath = sourceSets.launcherTest.runtimeClasspath
-	mainClass = 'dev.loadonce.launcher.LeydenSmoke'
+	mainClass = 'com.qb20nh.loadonce.launcher.LeydenSmoke'
 }
 
 tasks.register('cracIntegrationSmoke', JavaExec) {
@@ -362,7 +362,7 @@ tasks.register('cracIntegrationSmoke', JavaExec) {
 	description = 'Verifies isolated CRaC images, fresh-process reconstruction and manifest fallback.'
 	dependsOn tasks.named('launcherTestClasses'), tasks.named('runtimeJar')
 	classpath = sourceSets.launcherTest.runtimeClasspath
-	mainClass = 'dev.loadonce.launcher.CracIntegrationSmoke'
+	mainClass = 'com.qb20nh.loadonce.launcher.CracIntegrationSmoke'
 	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
 		args '--java', providers.gradleProperty('loadonceCracJava').get()
 	}
@@ -383,7 +383,7 @@ tasks.register('nativeDisplaySmoke', JavaExec) {
 	description = 'Runs native reconstruction on a private authenticated software display using Java.'
 	dependsOn tasks.named('launcherTestClasses'), tasks.named('writeNativeProbeClasspath')
 	classpath = sourceSets.launcherTest.runtimeClasspath
-	mainClass = 'dev.loadonce.launcher.NativeDisplaySmoke'
+	mainClass = 'com.qb20nh.loadonce.launcher.NativeDisplaySmoke'
 	if (providers.gradleProperty('loadonceXvfb').isPresent()) {
 		args '--xvfb', providers.gradleProperty('loadonceXvfb').get()
 	}
@@ -407,7 +407,7 @@ java {
 }
 
 tasks.named('sourcesJar') {
-	from('src/main/java') { include 'dev/loadonce/agent/**', 'dev/loadonce/supervisor/**' }
+	from('src/main/java') { include 'com/qb20nh/loadonce/agent/**', 'com/qb20nh/loadonce/supervisor/**' }
 }
 
 jar {

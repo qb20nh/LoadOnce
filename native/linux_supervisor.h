@@ -224,7 +224,7 @@ static void lo_linux_exec_wrapper(const struct configuration *config, const char
     arguments[6] = agent_option;
     arguments[7] = "-cp";
     arguments[8] = config->supervisor;
-    arguments[9] = "dev.loadonce.supervisor.SupervisorMain";
+    arguments[9] = "com.qb20nh.loadonce.supervisor.SupervisorMain";
     arguments[10] = "--input-descriptor";
     arguments[11] = input_number;
     arguments[12] = "--completion-descriptor";

@@ -2,6 +2,10 @@
 
 Recorded on 2026-10-10. Work continues on `main` only, from `ff737b4` and the earlier `codex/crac-leyden-native-restoration` prototype. Sources are in `/workspace/LoadOnce`; prepared toolchains are under `/workspace/.loadonce`. Live displays and processes do not survive an environment restart.
 
+The Fabric identity is now `loadonce` / `LoadOnce`, with Maven group `com.qb20nh.loadonce` and `loadonce-1.0.0` artifact names. The entrypoints are `com.qb20nh.loadonce.LoadOnceMod` and `com.qb20nh.loadonce.client.LoadOnceClient`; mixin resources and classes use the same project identity. Remove the previous mod artifact when upgrading, update direct agent paths, and reinstall private runtimes into new directories because installed artifact paths are absolute. See the [local development handover](HANDOVER.md).
+
+The last verified supervisor baseline before this identity rename is commit `374308dcf38b6d25a25d81902d07449405f8e9d3`, with green [Linux/Windows CI](https://github.com/qb20nh/LoadOnce/actions/runs/38051901162). The runtime evidence below belongs to that baseline or the explicitly identified earlier runs; it does not by itself verify the identity rename. Use `git rev-parse HEAD` and the CI run for that commit when continuing locally.
+
 ## External launchers and redirected Java executables
 
 The external-launcher integration now runs a Java 17 supervisor behind private Linux `java` and Windows `java.exe`/`javaw.exe` executables. Prism, Modrinth, CurseForge and vanilla select that executable; normal launches need no manually invoked JAR launcher. The installed supervisor uses the launcher artifact internally, with all startup/cache policy in Java. A direct premain-only configuration remains available. See [setup and boundaries](external-launchers.md).
@@ -81,10 +85,10 @@ Repeat with the Java display harness:
 
 ```sh
 ./gradlew writeLauncherTestClasspath writeNativeProbeClasspath
-java -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.NativeDisplaySmoke \
+java -cp "$(cat build/launcher-test-classpath.txt)" com.qb20nh.loadonce.launcher.NativeDisplaySmoke \
   --xvfb /workspace/.loadonce/prototype/native-host/root/usr/bin/Xvfb \
   --command /workspace/.loadonce/toolchains/jdk-25.0.2/bin/java \
-  -cp "$(cat build/launcher-test-classpath.txt)" dev.loadonce.launcher.CracIntegrationSmoke \
+  -cp "$(cat build/launcher-test-classpath.txt)" com.qb20nh.loadonce.launcher.CracIntegrationSmoke \
   --java /workspace/.loadonce/prototype/runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64/bin/java \
   --native-classpath-file build/native-probe-classpath.txt --native-reconfigure
 ```

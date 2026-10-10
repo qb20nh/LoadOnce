@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "com.qb20nh.loadonce.client.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"LoadOnceClientMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

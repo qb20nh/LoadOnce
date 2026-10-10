@@ -2,15 +2,17 @@
 
 Select LoadOnce's private Java executable in an external launcher to run its original command through the Java supervisor. The supervisor selects startup policy and loads the agent in the game JVM. The Fabric mod provides version-specific game hooks. The same agent can also be configured directly when only premain integration is wanted.
 
+The Fabric mod ID is `loadonce` and its display name is `LoadOnce`. Builds use the `loadonce` artifact prefix. If upgrading from the former template names, remove the old mod JAR from the instance, update direct agent paths, and recreate any private runtime in a new directory. Do not leave both mod JARs installed. Installed paths are absolute and are not migrated automatically.
+
 ## JVM-argument setup
 
-Build `./gradlew build`. Put `modid-1.0.0.jar` and matching Fabric API into a Minecraft 26.3 Fabric instance's mods directory. Store `modid-1.0.0-agent.jar` outside that directory and add one JVM argument:
+Build `./gradlew build`. Put `loadonce-1.0.0.jar` and matching Fabric API into a Minecraft 26.3 Fabric instance's mods directory. Store `loadonce-1.0.0-agent.jar` outside that directory and add one JVM argument:
 
 ```text
--javaagent:/absolute/path/modid-1.0.0-agent.jar
+-javaagent:/absolute/path/loadonce-1.0.0-agent.jar
 ```
 
-If a path contains spaces, quote the entire argument according to your launcher's argument editor, for example `"-javaagent:C:\My Tools\modid-1.0.0-agent.jar"`. Do not add `java -jar` to the application's arguments. A plain vanilla installation can load the agent, but it needs a Fabric profile to load this mod's game hooks. The agent targets Java 17 or newer; this mod version requires Java 25 and Minecraft 26.3.
+If a path contains spaces, quote the entire argument according to your launcher's argument editor, for example `"-javaagent:C:\My Tools\loadonce-1.0.0-agent.jar"`. Do not add `java -jar` to the application's arguments. A plain vanilla installation can load the agent, but it needs a Fabric profile to load this mod's game hooks. The agent targets Java 17 or newer; this mod version requires Java 25 and Minecraft 26.3.
 
 The agent leaves the launcher's main class, account arguments and standard streams intact. It stays quiet by default so Java-version/checker output remains usable. Add `-Dloadonce.agent.verbose=true` to request fixed startup identifiers on stderr. The Fabric initializer reaches its status endpoint through the system classloader, avoiding duplicate agent state in Fabric's Knot classloader. Agent classes are excluded from the mod JAR.
 
@@ -28,13 +30,13 @@ Windows executables link the C runtime statically; the private runtime directory
 ./gradlew redirectorDistribution redirectorSmoke supervisorAotSmoke
 ```
 
-The distribution ZIP under `build/distributions/` contains the supervisor/agent JARs and `redirectors/` executables for that platform. From the build tree, install into a new directory:
+The distribution ZIP under `build/distributions/` is named `loadonce-1.0.0-redirector-linux.zip` or `loadonce-1.0.0-redirector-windows.zip`. It contains the supervisor/agent JARs and `redirectors/` executables for that platform. From the build tree, install into a new directory:
 
 ```sh
-java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller \
+java -cp build/libs/loadonce-1.0.0-agent.jar com.qb20nh.loadonce.agent.RuntimeRedirectInstaller \
   --java-home /path/to/real/jdk --redirectors-dir build/native-redirectors \
-  --agent-jar build/libs/modid-1.0.0-agent.jar \
-  --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
+  --agent-jar build/libs/loadonce-1.0.0-agent.jar \
+  --supervisor-jar build/libs/loadonce-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
 ```
 
 This command runs setup once. Normal game launches use the native executable directly. The installer copies the supervisor, agent and native binaries, writes fixed paths into `bin/loadonce-runtime.conf`, and writes startup policy to `loadonce-policy.conf`. It requires a new output directory outside the backend JDK. Do not move an installed directory; rerun setup into a new location if paths change.
@@ -46,7 +48,7 @@ On Windows, run setup with the selected backend JDK. The installer requires its 
 On Windows, build with `.\gradlew.bat` and use a single-line PowerShell setup command, substituting your actual JDK and output paths:
 
 ```powershell
-java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller --java-home "C:\Java\jdk-25" --redirectors-dir build/native-redirectors --agent-jar build/libs/modid-1.0.0-agent.jar --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir "C:\Java\loadonce-runtime"
+java -cp build/libs/loadonce-1.0.0-agent.jar com.qb20nh.loadonce.agent.RuntimeRedirectInstaller --java-home "C:\Java\jdk-25" --redirectors-dir build/native-redirectors --agent-jar build/libs/loadonce-1.0.0-agent.jar --supervisor-jar build/libs/loadonce-1.0.0-launcher.jar --output-dir "C:\Java\loadonce-runtime"
 ```
 
 When using an extracted ZIP, use its agent/launcher JAR paths and `redirectors` directory.
@@ -84,3 +86,5 @@ Launcher settings and code references:
 - [Modrinth Java installations](https://support.modrinth.com/en/articles/8797659-java-installations) and [runtime validation](https://github.com/modrinth/code/blob/main/packages/app-lib/src/util/jre.rs).
 - [CurseForge Minecraft setup](https://support.curseforge.com/support/solutions/articles/9000218572-getting-started).
 - [Mojang's Java executable guidance](https://feedback.minecraft.net/hc/en-us/articles/15044886907149-Minecraft-Java-Edition-23w16a).
+
+See the [local development handover](HANDOVER.md) for build commands, verification evidence and remaining restoration work.

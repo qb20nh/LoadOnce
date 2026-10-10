@@ -589,7 +589,7 @@ static int redirect_windows(void) {
     bootstrap_arguments[6] = agent_option;
     bootstrap_arguments[7] = L"-cp";
     bootstrap_arguments[8] = supervisor;
-    bootstrap_arguments[9] = L"dev.loadonce.supervisor.SupervisorMain";
+    bootstrap_arguments[9] = L"com.qb20nh.loadonce.supervisor.SupervisorMain";
     bootstrap_arguments[10] = L"--input-descriptor";
     bootstrap_arguments[11] = input_descriptor;
     bootstrap_arguments[12] = L"--completion-descriptor";
