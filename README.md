@@ -25,17 +25,19 @@ python3 tests/smoke_leyden.py
 
 A host integration supplies a `CheckpointGate` that must prove the lifecycle boundary is reusable: credentials, sessions, connections, world state, and unmanaged external resources must be excluded. The library cannot establish that proof for an arbitrary game or mod. A denied gate changes no resources. Partial preparation is compensated; failed compensation or restoration stops every participant and leaves the coordinator `STOPPED`.
 
-`CracBridge` optionally registers a strongly held resource with the actual `jdk.crac` API through reflection. It does not implement a checkpoint engine or simulate CRaC callbacks. `cracSmoke` invokes the engine on an isolated CPU-only probe:
+`CracBridge` optionally registers a strongly held resource with the actual `jdk.crac` API through reflection. It does not implement a checkpoint engine or simulate CRaC callbacks. The clean fixture driver compiles the standalone runtime, checks failure recovery through real callbacks, creates an image, and restores that same image into three fresh JVMs:
 
 ```sh
-bash ./gradlew cracSmoke -PloadonceCracJava=/path/to/crac-jdk/bin/java
+python3 tools/smoke_crac.py --java /path/to/crac-jdk/bin/java
 ```
 
-The VM needs its own documented engine configuration. The tasks accept `-PloadonceCracEngine=ENGINE_NAME` and provide an image directory under `build/`. Engine availability, callback thread behavior, and real images must be tested on that runtime. Callback completion, including a runtime's simulation mode, does not establish a kernel snapshot.
+This has passed with Azul CRaC JDK 25.0.4.1's `warp` engine without elevated kernel capabilities. It checks a retained heap witness, value, callback counts, coordinator state and kernel process IDs. It also tests gate denial, preparation/restoration failure and real open-file rejection. Logs and private fixture images remain under `build/crac-validation/`. The driver excludes inherited launcher credentials and injected JVM/native options; it only checkpoints its isolated fixture.
+
+`--engine simengine` verifies callbacks without an image; `--engine criuengine` exercises CRIU on a capable host. This container blocks CRIU. Engine options and successful checkpoint exit codes differ: a fatal engine failure needs launcher/supervisor recovery. The original `cracSmoke` Gradle task remains available for manually configured runtimes, but its child inherits the caller environment. Use the clean driver for saved images.
 
 ## GLFW, graphics, and audio reconstruction
 
-`nativeRestorationProbe` creates and destroys real LWJGL 3.4.3 resources. It verifies GLFW window settings, six native callback registrations and delivered resize events; OpenGL texture and buffer contents, shader linking, framebuffer completeness and rendered pixels; and OpenAL device/context, PCM format, source attachment and playback state. It retains CPU descriptors and clears tracked handle values after release. Numeric handle values may be reused by drivers.
+`nativeRestorationProbe` creates and destroys real LWJGL 3.4.3 resources. It verifies GLFW window settings, elapsed time, six native callback registrations and delivered resize events; OpenGL texture and buffer contents, shader linking, framebuffer completeness and rendered pixels; and OpenAL device/context, PCM format, source attachment, playback state and sample offset. It retains CPU descriptors, checks native object deletion/context detachment and clears tracked handle values after release. Numeric handle values may be reused by drivers.
 
 With an existing X11 display and audio device:
 
@@ -43,14 +45,15 @@ With an existing X11 display and audio device:
 bash ./gradlew nativeRestorationProbe -PloadonceCycles=10
 ```
 
-With Xvfb, Mesa software rendering and an explicit null audio backend:
+With Xvfb and Mesa software rendering, use the managed display wrapper:
 
 ```sh
-xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 ALSOFT_DRIVERS=null \
-  bash ./gradlew nativeRestorationProbe -PloadonceCycles=10
+tools/native-smoke.sh --xvfb /path/to/Xvfb
 ```
 
-The null backend verifies OpenAL lifecycle, not physical playback. Software rendering does not verify a hardware GPU or driver survives process restoration. Input callback registration is tested; real keyboard/mouse interaction and controllers require additional checks. The probe source is deliberately muted.
+The wrapper defaults to ten cycles and `-PloadonceAudioLoopback=true`. OpenAL Soft's loopback device renders 2,048 float PCM samples per generation, requires nonzero output, compares them with the initial render within `1e-6`, and checks playback cursor advancement. The primary source remains muted; the verification source renders only to memory. `SOFT_buffer_samples` readback runs when the extension is available. No physical audio device is needed.
+
+The wrapper uses an authenticated temporary X11 display and cleans up its processes and private directories. It requires `Xvfb`, `xauth`, `setsid`, and Mesa. Set `LOADONCE_XVFB` or use `--xvfb` for an extracted binary. With an existing display, `bash ./gradlew nativeRestorationProbe -PloadonceAudioLoopback=true` runs the same PCM checks. The default device path and `ALSOFT_DRIVERS=null` remain supported. Software rendering and loopback audio do not establish hardware GPU or physical audio restoration; real keyboard/mouse interaction and controllers also need additional checks.
 
 The failure probe must exit unsuccessfully after an invalid shader interrupts restoration. Its output must include `coordinator-state=STOPPED`, `failure-stop-verified=true`, and `cleanup=tracked-handles-zero native-release=ok`:
 
@@ -58,7 +61,16 @@ The failure probe must exit unsuccessfully after an invalid shader interrupts re
 bash ./gradlew nativeRestorationProbe -PloadonceInvalidShader=true
 ```
 
-On a configured CRaC JDK, add `-PloadonceUseCrac=true` and `-PloadonceCracJava=/path/to/crac-jdk/bin/java` to route the same resources through real CRaC callbacks. This path remains unverified in the current environment.
+To test an actual native process image with a minimal environment:
+
+```sh
+bash ./gradlew writeNativeProbeClasspath
+tools/native-smoke.sh --xvfb /path/to/Xvfb --command \
+  python3 tools/smoke_crac.py --java /path/to/crac-jdk/bin/java \
+  --native-classpath-file build/native-probe-classpath.txt
+```
+
+This test requires the selected runtime to accept all resources after teardown and complete new-process reconstruction. See the continuation notes for current native image evidence and remaining blockers. The `--command` mode preserves argument boundaries and returns the driver's status.
 
 ## Leyden AOT command wrapper
 
@@ -83,11 +95,11 @@ Training executes the application once and promotes a cache only after a success
 
 The fingerprint covers the JVM binary/libraries/configuration, original arguments, relevant environment, classpath and manifest dependencies, module paths, agents and declared inputs. It reads their contents on each launch, so fingerprinting has a cost that is not yet optimized. Private cache entries require a complete manifest and matching archive checksum. Unsupported, missing, changed, corrupt or busy caches fall back before launching the application. A child launch is never replayed after failure; the JVM may discard incompatible AOT data during that single launch.
 
-Recognized sensitive launch options disable caching; use `--sensitive` for custom secret-bearing options. Argument files, injected JVM options and native-library injection environments also select ordinary startup. Original argument boundaries and authentication behavior are preserved. Metadata contains digests rather than argument text. The AOT cache reuses JVM class/linking data; it is not a saved application process or warmed JIT machine-code cache.
+Recognized sensitive launch options and known credential environment variables disable caching and reject training; use `--sensitive` for custom secret-bearing options or credentials read from application files. Argument files, injected JVM options (including `JDK_AOT_VM_OPTIONS`) and native-library injection environments also select ordinary startup. LWJGL's explicit library and extraction paths are content-fingerprinted. Cache schema 2 rejects older artifacts created before the environment protections. Original argument boundaries and authentication behavior are preserved. Metadata contains digests rather than argument text. The AOT cache reuses JVM class/linking data; it is not a saved application process or warmed JIT machine-code cache.
 
 ## Current evidence and next step
 
-See [prototype validation and continuation notes](docs/prototype-status.md) for the exact environment evidence and restart requirements. The next integration work is to capture Minecraft's renderer/resource ownership and a credential-free lifecycle boundary, then validate CRaC/CRIU restoration on a host with the necessary kernel and graphics capabilities. Startup speed and memory improvements have not been measured yet.
+See [prototype validation and continuation notes](docs/prototype-status.md) for the exact environment evidence and restart requirements. The next integration work is to capture Minecraft's renderer/resource ownership and a credential-free lifecycle boundary, then prove an interactive main menu on supported hardware. Startup speed and memory improvements have not been measured yet.
 
 ## License
 

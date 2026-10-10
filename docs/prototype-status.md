@@ -1,70 +1,91 @@
 # Prototype validation and continuation
 
-Recorded on 2026-10-10. Sources are in `/workspace/LoadOnce`; retained tools and local test dependencies are outside the checkout in `/workspace/.loadonce`. Runtime processes do not survive an environment restart.
+Recorded on 2026-10-10. Continued from commit `114b5dd` on `codex/crac-leyden-native-restoration`; the destination branch is `main` only. Sources are in `/workspace/LoadOnce`; retained tools are under `/workspace/.loadonce`. Live processes do not survive an environment restart.
 
-## Validated paths
+## Actual CRaC process images
 
-- Oracle JDK 25.0.2 exposes `AOTCacheOutput`, `AOTCache`, and `AOTMode`. Real isolated JAR and modular-JAR applications trained AOT caches and launched with them. This establishes cache creation/use, not a Minecraft speed improvement.
-- The common runtime compiles independently with `javac --release 17 -Xlint:all -Werror`. Its contract test covers lifecycle dependency order, partial rollback, failed restoration/resumption, engine abort recovery, registration, reentrancy, thread ownership and gate denial.
-- `build/libs/modid-1.0.0-runtime.jar` contains only the shared runtime classes and license. Its class file version is 61 (Java 17), independent of the Java 25 Fabric target.
-- The final native probe completed ten full release/recreate cycles with Xvfb, Mesa llvmpipe 25.0.7 and OpenAL Soft's null backend. Every cycle checked native callback delivery, resource contents, shader rendering and OpenAL state. This is an in-process lifecycle test, not process checkpoint restoration.
-- The full Gradle build passed, including 718 executable lifecycle checks. All 25 Python launcher tests passed. The deliberate shader failure left the coordinator `STOPPED` and verified all tracked handles were cleared with successful native cleanup.
-- The conventional dedicated-server smoke reached `Done`, returned Minecraft 26.3 / protocol 777 with 0/20 players and a valid ping response, and stopped through stdin with Gradle exit status 0. This checks the existing target's normal startup, not optimized restoration or external authentication.
+Azul CRaC JDK 25.0.4.1, build `Zulu25.36+205-CRaC-CA`, is installed at:
 
-`python3 tests/smoke_leyden.py` is the retained real JVM integration test. It checks that the JVM actually opens the AOT cache, preserves literal arguments, executes a failing warm application once, and falls back once on corrupt cache bytes. CI runs the build, Python contract suite and this real Leyden check.
-
-The native tools came from Debian's signed trixie repository using a private APT state directory and extracted packages. They were not installed into the host. The retained Xvfb binary is `/workspace/.loadonce/native-test/root/usr/bin/Xvfb`.
-
-To repeat the native check after restarting the environment, first start a display using the retained binary; `:91` is the display used here. Create `/tmp/.X11-unix` if absent. Keep the process controllable and stop it after testing:
-
-```sh
-/workspace/.loadonce/native-test/root/usr/bin/Xvfb :91 \
-  -screen 0 640x480x24 -nolisten tcp -noreset -xkbdir /usr/share/X11/xkb
+```text
+/workspace/.loadonce/prototype/runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64
 ```
 
-In another shell, activate Java and run:
+The archive was checked against Azul's official package metadata before extraction:
+
+- Package UUID: `5ca0f008-c0a5-45f0-8694-9919d3cc355d`.
+- Metadata: <https://api.azul.com/metadata/v1/zulu/packages/5ca0f008-c0a5-45f0-8694-9919d3cc355d/>.
+- Archive SHA-256: `6d1beee9795c544f53ff7e665d6455081960d18b476c0f6054f5e35cef97b61e`.
+
+Both `api.azul.com` and `cdn.azul.com` work through the environment proxy. No additional host allowlist entries are needed for these checks.
+
+The `warp` engine created an actual CPU fixture image and restored the same image into three new JVMs. The enhanced `CracSmoke` checks a retained random heap witness, value `42`, one preparation/restoration callback, coordinator `READY`, and the kernel PID. The driver compares the saved PID and witness with each separately launched child; ordinary fixture startup cannot satisfy the restored-state evidence.
+
+The native fixture also created an actual Warp image: `core.img` was 68,231,168 bytes. Three fresh JVM restores of that same image each resumed at cycle 1 and passed GLFW timer/window/callback checks, OpenGL texture/buffer readback and shader rendering, OpenAL playback offset and rendered PCM comparison, and native cleanup. No initial cycle 0 ran in the restored JVMs. This proves process-image restoration with reconstruction on the selected software graphics/audio stack, not a Minecraft or hardware GPU snapshot.
+
+The clean driver also passed real CRaC gate denial, partial preparation recovery, and failed restoration stopping the coordinator. An intentionally open, unregistered `FileInputStream` caused the real Warp checkpoint boundary to reject the attempt; both callbacks ran on the owner thread, the coordinator recovered to `READY`, and the rejected image directory stayed empty. `simengine` separately passed callbacks and is labelled as simulation.
+
+The driver starts fixture JVMs with `PATH`, private `HOME`, and `LANG`, excluding inherited tokens, injected JVM options and native preloads. Native mode additionally uses the test display/auth path, private XDG/Mesa directories, software rendering, and an explicit null hardware audio backend. The local X11 cookie belongs to the temporary test display; it is not launcher authentication. Images/logs are private local test artifacts under ignored `build/`, never published with the source.
+
+Repeat the CPU test:
 
 ```sh
-source /workspace/.loadonce/setup/activate.sh
-cd /workspace/LoadOnce
-DISPLAY=:91 XDG_RUNTIME_DIR=/workspace/.loadonce/native-test/xdg \
-MESA_SHADER_CACHE_DIR=/workspace/.loadonce/native-test/mesa-cache \
-LIBGL_ALWAYS_SOFTWARE=1 ALSOFT_DRIVERS=null \
-bash ./gradlew nativeRestorationProbe -PloadonceCycles=10
+python3 tools/smoke_crac.py --java /path/to/verified-crac-jdk/bin/java
 ```
 
-The retained `xdg` directory is private and the Mesa cache directory is writable. Verification logs are in `/workspace/.loadonce/native-test/`.
-
-## CRaC runtime download
-
-The installed Oracle JDK has neither the CRaC flags nor `jdk.crac.Core`. The reflective bridge and its CRaC native-probe path therefore remain unverified against a real CRaC engine.
-
-`cdn.azul.com` is allowed and its official directory lists CRaC JDK 25 packages, including `zulu25.32.23-ca-crac-jdk25.0.2-linux_x64.tar.gz`. The attempted checksum suffixes were not published there. The package metadata request to `api.azul.com` was explicitly denied by the proxy with HTTP 403.
-
-**Add `api.azul.com` to the environment host allowlist on the next chat/environment restart**, preserving the existing hosts and package-manager presets. The user reported that applying this change requires restarting the chat. After restart, verify the active network policy, fetch Azul's official package metadata/checksum, and verify the runtime archive before testing. No CRaC archive was installed without that verification.
-
-Then run both the isolated `cracSmoke` and the native probe with the actual runtime's supported engine settings. First verify callbacks and failure recovery; separately verify checkpoint image creation and restoration in a new process. A successful simulation engine is only callback evidence.
-
-## CRIU and host requirements
-
-CRIU 4.1.1 is extracted at `/workspace/.loadonce/native-test/root/usr/sbin/criu`. To inspect it:
+Repeat the native image test after compiling its classpath with the prepared JDK 25:
 
 ```sh
 source /workspace/.loadonce/setup/activate.sh
 cd /workspace/LoadOnce
-PATH=/workspace/.loadonce/native-test/root/usr/sbin:$PATH \
-LD_LIBRARY_PATH=/workspace/.loadonce/native-test/root/usr/lib/x86_64-linux-gnu \
-python3 tools/loadonce.py doctor --java "$JAVA_HOME/bin/java"
+bash ./gradlew --no-daemon --console=plain --max-workers=2 writeNativeProbeClasspath
+tools/native-smoke.sh \
+  --xvfb /workspace/.loadonce/prototype/native-host/root/usr/bin/Xvfb \
+  --command python3 tools/smoke_crac.py \
+  --java /workspace/.loadonce/prototype/runtime/zulu25.36.205-ca-crac-jdk25.0.4.1-linux_x64/bin/java \
+  --native-classpath-file build/native-probe-classpath.txt
 ```
 
-The actual kernel check exits 1 and requires `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`. The container's effective and bounding capabilities are zero. `/dev/dri` is absent. An HTTP allowlist change cannot supply kernel capabilities, physical graphics or audio devices.
+The driver defaults to three restores, limits each child to 60 seconds, and stops its JVM/helper group on cancellation. The display wrapper uses a dynamically allocated X11 display, private authentication, and bounded process cleanup. Images still depend on the same runtime/native binaries, library paths and a compatible live display; the fixture driver is not an image compatibility/fallback launcher for arbitrary applications.
 
-Use a suitably configured Linux test host for actual process images and hardware restoration. Do not use plain CRIU to snapshot the running Minecraft test world: the prototype has not established credential/session exclusion, native ownership, or persistent-world consistency.
+Local evidence from this continuation:
 
-## Remaining Minecraft integration
+- CPU save/repeated restores and descriptor rejection: `build/crac-validation/run-dbx_vdu8/`.
+- Native save/repeated restores: `build/crac-validation/run-tq1_2tj_/`.
+- Callback-only simulation: `build/crac-validation/run-_jm2f3wt/`.
+- CRIU rejection: `build/crac-validation/run-bf2tsxhk/`.
 
-The Fabric target is still pinned to Minecraft 26.3, loader 0.19.5 and Java 25. Existing entrypoints and Mixins are unchanged. The generic lifecycle library has no Minecraft imports, but there is no version/loader-agnostic lifecycle discovery or launcher integration yet. Minecraft 26.3 uses SDL, so its renderer integration needs an SDL adapter as well as the GLFW path demonstrated here.
+Warp logs a nonfatal attempt to write read-only `/proc/self/comm`; both engine success markers and application verification passed. This message is not suppressed.
 
-Before automatic process checkpointing, enumerate renderer/audio/native resource owners and reconstruction data, quiesce asynchronous work on the appropriate threads, exclude credentials and gameplay/world state, refresh authorized session state after restore, and prove a fully interactive main menu. Dedicated servers must reload current persistent world data rather than restoring stale in-memory world state. Existing authentication must remain enabled.
+## Native ownership and the PulseAudio boundary
 
-The earlier setup's external Minecraft Services discovery routing limitation remains separate from these local checks; status/ping readiness does not validate account authentication. No interactive Minecraft client or hardware GPU/audio restore has been verified. There is no measured startup-speed, memory, lazy-page restoration, shader-cache, native-fusion or warmed JIT reuse result yet.
+Ten in-process reconstruction cycles passed on LWJGL 3.4.3, Xvfb, Mesa llvmpipe 25.0.7 and OpenAL Soft. Each generation renders 2,048 mono float PCM samples and compares them with the initial sample array within `1e-6`. The observed hash was `-750305279`; energy was nonzero. Playback offsets alternated between 128 and 2176 as expected. The available OpenAL build does not expose `SOFT_buffer_samples`, so direct buffer readback did not run; actual loopback sample rendering did.
+
+Audio quiescence pauses the source before reading its cursor, preserving position for both rollback and reconstruction. GLFW elapsed time survives `glfwTerminate()`/`glfwInit()`. Native object deletion and detached contexts are checked rather than inferred from cleared Java fields. An injected invalid shader left the coordinator `STOPPED`, checked the failure marker, and released every tracked resource. The original default device path also passed three cycles with `ALSOFT_DRIVERS=null`.
+
+The first native Warp attempt rejected a residual pipe even though tracked handles were zero. `strace -k` attributed it to OpenAL's library-global PulseAudio mainloop: `pa_mainloop_new`/`pa_threaded_mainloop_new` inside `alcLoopbackOpenDeviceSOFT`. Device/context close did not destroy that backend; its pipe closed only at process exit. GLFW's separate wakeup pipe closed correctly in `glfwTerminate()`.
+
+For the headless loopback fixture, `ALSOFT_DRIVERS=null` prevents initialization of that unused physical backend while loopback still renders real PCM. A second trace confirmed that the residual pipe disappeared, and actual Warp save/repeated restore then passed. No descriptor exemption, forced close of an unknown handle, or validation bypass was used. Shared native libraries remain loaded; blindly unloading LWJGL providers would leave static function caches unsafe.
+
+Production PulseAudio backend shutdown/restoration is not implemented. Physical OpenAL devices, hardware GPUs/drivers, SDL ownership, real keyboard/mouse events, and controllers still require separate integration and host testing.
+
+The retained Xvfb was extracted from authenticated Debian trixie packages; it was not installed into the host. Logs are under `/workspace/.loadonce/prototype/native-host/logs/`; the pipe traces are under `/workspace/.loadonce/prototype/native-fd/`.
+
+## Leyden and regression checks
+
+The final Gradle build compiles both Minecraft source sets and the native fixture, packages the Java 17 standalone runtime, and runs 718 lifecycle contract checks. The default JUnit `test` task still has no sources; these executable contract checks are separate.
+
+All 30 Python launcher tests pass. `tests/smoke_leyden.py` passes against Oracle JDK 25.0.2, verifying actual AOT cache mapping, exact argument boundaries, failed training retaining the previous cache, nonzero application exit without replay, JVM archive rejection falling back in the same JVM, prelaunch corruption fallback, and credential-environment refusal before main executes.
+
+Known credential environment variables now disable caching/reject training. `JDK_AOT_VM_OPTIONS` requires ordinary startup. Explicit LWJGL library and extraction paths enter content fingerprints. Cache schema 2 invalidates earlier artifacts created before these checks. Custom credentials loaded from arbitrary files/environment variables still require `--sensitive` and host integration; there is no universal credential discovery.
+
+CI includes the build, Python contracts, real Leyden smoke, software native loopback cycles and deliberate native failure cleanup. CRaC image tests require a verified CRaC JDK and remain explicit local integration checks.
+
+## CRIU and remaining Minecraft integration
+
+Bundled CRIU `3.17.1-crac` fails its actual kernel check and checkpoint in this container: read-only `/proc/loginuid`, socket operations rejected with `EPERM`, and failed TCP-repair probing. Effective and bounding capabilities are zero, `NoNewPrivs=1`, and seccomp filtering is enabled. The CRIU engine terminates the JVM after failure; Java callback recovery alone cannot provide conventional-startup fallback for that case. A future supervisor must own that decision. An HTTP allowlist cannot supply kernel capabilities or devices.
+
+The driver supplies Warp's `checkpoint_exit_code=0` only to Warp. CRIU/simulation reject that engine option. CRIU's checkpoint termination is accepted only provisionally; image contents, successful separate restore, and application-state verification are still mandatory for a passing result. Actual CRIU restoration remains blocked/unverified here.
+
+The Fabric target remains Minecraft 26.3, loader 0.19.5 and Java 25, with its original entrypoints/Mixins. It uses SDL, so the independently verified GLFW fixture does not implement its renderer integration. The previous conventional dedicated-server readiness/status/ping smoke remains prior evidence; it was not rerun for this fixture-only continuation. External Minecraft authentication routing is also separate from local status readiness.
+
+Before automatic Minecraft checkpointing, establish renderer/audio/native ownership and reconstruction data, quiesce work on its owner threads, exclude credentials/world/session state, reattach authorized sessions, and prove a fully interactive main menu. Servers must load current persistent world data. Hardware restoration, startup-speed or memory improvements, lazy paging, persistent shader caching, warmed JIT reuse and native compilation have not been measured or implemented by these tests.

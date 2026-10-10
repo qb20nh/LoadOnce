@@ -73,12 +73,30 @@ tasks.register('nativeRestorationProbe', JavaExec) {
 	if (providers.gradleProperty('loadonceInvalidShader').getOrElse('false').toBoolean()) {
 		args '--invalid-shader-on-restore'
 	}
+	if (providers.gradleProperty('loadonceAudioLoopback').getOrElse('false').toBoolean()) {
+		args '--audio-loopback'
+	}
 	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
 		executable = providers.gradleProperty('loadonceCracJava').get()
 	}
 	if (providers.gradleProperty('loadonceCracEngine').isPresent()) {
 		jvmArgs "-XX:CRaCEngine=${providers.gradleProperty('loadonceCracEngine').get()}",
 				"-XX:CRaCCheckpointTo=${layout.buildDirectory.dir('crac-probe').get().asFile}"
+	}
+}
+
+// Allows the native CRaC smoke to launch a clean JVM without inheriting Gradle's
+// environment or open descriptors. The classpath is local build output only.
+def nativeProbeClasspath = sourceSets.prototype.runtimeClasspath
+def nativeProbeClasspathFile = layout.buildDirectory.file('native-probe-classpath.txt')
+tasks.register('writeNativeProbeClasspath') {
+	group = 'verification'
+	description = 'Writes the standalone native probe classpath for the clean CRaC smoke driver.'
+	dependsOn tasks.named('prototypeClasses')
+	inputs.files(nativeProbeClasspath)
+	outputs.file(nativeProbeClasspathFile)
+	doLast {
+		nativeProbeClasspathFile.get().asFile.text = nativeProbeClasspath.filter { it.exists() }.asPath + '\n'
 	}
 }
 

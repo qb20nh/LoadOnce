@@ -166,6 +166,40 @@ class LauncherTests(unittest.TestCase):
             loadonce.train(command, self.root, self.inputs)
         self.assertFalse(self.root.exists())
 
+    def test_known_credential_environments_reject_training_before_any_child(self):
+        for name in ("GH_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                     "GOOGLE_APPLICATION_CREDENTIALS", "MINECRAFT_ACCESS_TOKEN", "gh_token"):
+            with self.subTest(environment=name), mock.patch.dict(os.environ, {name: "opaque-credential-value"}), \
+                    mock.patch.object(loadonce, "probe_java") as probe, \
+                    mock.patch.object(loadonce.subprocess, "run", return_value=
+                                      subprocess.CompletedProcess(self.command, 9)) as child:
+                self.assertEqual(loadonce.run(self.command, self.root, self.inputs), 9)
+                child.assert_called_once_with(self.command)
+                probe.assert_not_called()
+                child.reset_mock()
+                with self.assertRaises(loadonce.CacheError):
+                    loadonce.train(self.command, self.root, self.inputs)
+                child.assert_not_called()
+                probe.assert_not_called()
+        self.assertFalse(self.root.exists())
+        self.assertNotIn("opaque-credential-value", self.stderr.getvalue())
+
+    def test_proxy_credentials_reject_training_without_exposing_values(self):
+        for value in ("https://user:opaque-password@proxy.invalid", "https://opaque-token@proxy.invalid"):
+            with self.subTest(proxy=value), mock.patch.dict(os.environ, {"https_proxy": value}), \
+                    mock.patch.object(loadonce.subprocess, "run") as child:
+                with self.assertRaises(loadonce.CacheError):
+                    loadonce.train(self.command, self.root, self.inputs)
+                child.assert_not_called()
+        self.assertFalse(self.root.exists())
+        self.assertNotIn("opaque-password", self.stderr.getvalue())
+
+    def test_noncredential_session_and_empty_credential_variables_allow_caching(self):
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "ordinary-session", "XDG_SESSION_TYPE": "x11",
+                                        "GH_TOKEN": "", "HTTP_PROXY": "http://session-proxy.invalid:3128"}):
+            self.assertEqual(self.train_cache(), 0)
+            self.assertIn("-XX:AOTMode=auto", self.run_once())
+
     def test_native_library_environment_preserves_cold_launch_and_rejects_training(self):
         library = self.base / "injected.so"
         library.write_bytes(b"native-library-v1")
@@ -184,6 +218,34 @@ class LauncherTests(unittest.TestCase):
                 child.assert_called_once_with(self.command)
                 probe.assert_not_called()
         self.assertFalse(self.root.exists())
+
+    def test_explicit_native_library_paths_invalidate_on_content_changes(self):
+        libraries = self.base / "native"
+        libraries.mkdir()
+        library = libraries / "libfixture.so"
+        base_command = self.command[:]
+        for option in ("-Djava.library.path=", "-Dorg.lwjgl.librarypath=",
+                       "-Dorg.lwjgl.system.SharedLibraryExtractPath="):
+            with self.subTest(option=option):
+                library.write_bytes(b"native-v1")
+                self.command = [base_command[0], option + str(libraries), *base_command[1:]]
+                self.assertIn(libraries, loadonce.launch_inputs(self.command)[0])
+                self.assertEqual(self.train_cache(), 0)
+                self.assertIn("-XX:AOTMode=auto", self.run_once())
+                info = library.stat()
+                library.write_bytes(b"native-v2")
+                os.utime(library, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.assertEqual(self.run_once(), self.command)
+
+    def test_native_library_changes_during_training_discard_archive(self):
+        native = self.base / "native"
+        native.mkdir()
+        library = native / "libfixture.so"
+        library.write_bytes(b"native-v1")
+        self.command.insert(1, "-Dorg.lwjgl.librarypath=" + str(native))
+        with self.assertRaises(loadonce.CacheError):
+            self.train_cache(mutate=lambda: library.write_bytes(b"native-v2"))
+        self.assertFalse(any(self.root.glob("*/manifest.json")))
 
     def test_warm_launch_preserves_argument_boundaries_and_order(self):
         self.command.extend(["two words", "literal$HOME", "literal*", "unicode-π", "--app-option=value"])
@@ -347,6 +409,7 @@ class LauncherTests(unittest.TestCase):
         corruptions = [
             {**original, "completed": False},
             {**original, "schema": True},
+            {**original, "schema": loadonce.SCHEMA - 1},
             {**original, "schema": loadonce.SCHEMA + 1},
             {**original, "uid": os.getuid() + 1},
             {**original, "bytes": True},

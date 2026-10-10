@@ -7,6 +7,7 @@ import dev.loadonce.runtime.CracBridge;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.nio.ShortBuffer;
 import java.util.Arrays;
 import java.util.function.BooleanSupplier;
 import org.lwjgl.glfw.Callbacks;
@@ -27,7 +28,10 @@ import org.lwjgl.system.MemoryUtil;
 
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.openal.AL10.*;
+import static org.lwjgl.openal.AL11.AL_SAMPLE_OFFSET;
 import static org.lwjgl.openal.ALC10.*;
+import static org.lwjgl.openal.SOFTBufferSamples.*;
+import static org.lwjgl.openal.SOFTLoopback.*;
 import static org.lwjgl.opengl.GL33C.*;
 
 /** Real native lifecycle proof, deliberately separate from Minecraft and process images. */
@@ -38,6 +42,7 @@ public final class NativeRestorationProbe {
         int cycles = 3;
         boolean invalidShaderOnRestore = false;
         boolean crac = false;
+        boolean audioLoopback = false;
         for (String arg : args) {
             if (arg.startsWith("--cycles=")) {
                 cycles = Integer.parseInt(arg.substring("--cycles=".length()));
@@ -45,20 +50,23 @@ public final class NativeRestorationProbe {
                 invalidShaderOnRestore = true;
             } else if (arg.equals("--crac")) {
                 crac = true;
+            } else if (arg.equals("--audio-loopback")) {
+                audioLoopback = true;
             } else {
-                throw new IllegalArgumentException("Usage: NativeRestorationProbe [--cycles=1..100] [--crac] [--invalid-shader-on-restore]");
+                throw new IllegalArgumentException("Usage: NativeRestorationProbe [--cycles=1..100] [--crac] [--audio-loopback] [--invalid-shader-on-restore]");
             }
         }
         require(cycles >= 1 && cycles <= 100, "cycles must be between 1 and 100");
         System.out.println("NATIVE_PROBE mode=" + (crac ? "CRaC-callback" : "in-process-lifecycle")
                 + "; no Minecraft renderer/session integration; callback/lifecycle proof alone does not establish a restorable OS image");
         String audioDriver = System.getenv("ALSOFT_DRIVERS");
-        System.out.println("NATIVE_PROBE audio-driver=" + (audioDriver == null ? "system default" : audioDriver)
-                + ("null".equals(audioDriver) ? "; null backend proves OpenAL lifecycle, not physical audio" : "; physical playback is not measured"));
+        System.out.println("NATIVE_PROBE audio-driver=" + (audioLoopback ? "OpenAL Soft loopback" : audioDriver == null ? "system default" : audioDriver)
+                + (audioLoopback ? "; rendered PCM is checked; physical playback is not measured"
+                        : "null".equals(audioDriver) ? "; null backend proves OpenAL lifecycle, not physical audio" : "; physical playback is not measured"));
 
         WindowResource window = new WindowResource();
         GraphicsResource graphics = new GraphicsResource(window, invalidShaderOnRestore);
-        AudioResource audio = new AudioResource();
+        AudioResource audio = new AudioResource(audioLoopback);
         CheckpointCoordinator coordinator = new CheckpointCoordinator(
                 () -> CheckpointGate.Decision.allow("Isolated native probe has CPU descriptors and no sessions or world state"));
         coordinator.register(window);
@@ -113,12 +121,13 @@ public final class NativeRestorationProbe {
         System.out.println("NATIVE_PROBE PASS cycles=" + cycles);
     }
 
-    private static void verify(WindowResource window, GraphicsResource graphics, AudioResource audio, int cycle) {
+    private static void verify(WindowResource window, GraphicsResource graphics, AudioResource audio, int cycle) throws Exception {
         window.verify();
         graphics.verify();
         audio.verify();
         System.out.println("NATIVE_PROBE verified cycle=" + cycle
-                + " window-state+native-callback-registration+resize-event+texture-bytes+buffer-floats+shader-link+rendered-pixels+audio-state");
+                + " window-state+restored-timer+native-callback-registration+resize-event+texture-bytes+buffer-floats+shader-link+rendered-pixels+audio-state"
+                + (audio.loopback ? "+rendered-pcm-equality" : ""));
     }
 
     private static void assertReleased(WindowResource window, GraphicsResource graphics, AudioResource audio) {
@@ -158,9 +167,15 @@ public final class NativeRestorationProbe {
         private GLFWWindowCloseCallback closeCallback;
         private int sizeEvents;
         private int framebufferEvents;
+        private double checkpointTime;
         private String lastError = "no GLFW error reported";
 
         @Override public String id() { return "glfw-window-context-callbacks"; }
+
+        @Override public void quiesce() {
+            owner();
+            checkpointTime = glfwGetTime();
+        }
 
         @Override public void restore() throws Exception {
             owner();
@@ -171,6 +186,8 @@ public final class NativeRestorationProbe {
                 glfwSetErrorCallback(errorCallback);
                 require(glfwInit(), "GLFW initialization failed; configure a display: " + lastError);
                 initialized = true;
+                // GLFW initialization resets its timer. Keep the application clock at the quiesced boundary.
+                glfwSetTime(checkpointTime);
                 glfwDefaultWindowHints();
                 glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
                 glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -208,6 +225,7 @@ public final class NativeRestorationProbe {
         void verify() {
             owner();
             require(handle != 0 && glfwGetCurrentContext() == handle, "GLFW context is not current");
+            require(glfwGetTime() >= checkpointTime, "GLFW elapsed timer regressed across restoration");
             require(glfwGetWindowAttrib(handle, GLFW_VISIBLE) == GLFW_TRUE, "window visibility was not restored");
             require(glfwGetWindowAttrib(handle, GLFW_RESIZABLE) == GLFW_TRUE, "window resizability was not restored");
             require(glfwGetInputMode(handle, GLFW_CURSOR) == GLFW_CURSOR_NORMAL, "cursor mode was not restored");
@@ -262,6 +280,7 @@ public final class NativeRestorationProbe {
                 cleanup.run(() -> Callbacks.glfwFreeCallbacks(oldWindow));
                 cleanup.run(() -> GL.setCapabilities(null));
                 cleanup.run(() -> glfwMakeContextCurrent(0));
+                cleanup.run(() -> require(glfwGetCurrentContext() == 0, "released GLFW context remains current"));
                 cleanup.run(() -> glfwDestroyWindow(oldWindow));
             }
             sizeCallback = null;
@@ -456,6 +475,9 @@ public final class NativeRestorationProbe {
             if (oldVertexBuffer != 0) cleanup.run(() -> glDeleteBuffers(oldVertexBuffer));
             if (oldTexture != 0) cleanup.run(() -> glDeleteTextures(oldTexture));
             if (oldTarget != 0) cleanup.run(() -> glDeleteTextures(oldTarget));
+            if (hadObjects) cleanup.run(() -> require(!glIsProgram(oldProgram) && !glIsFramebuffer(oldFramebuffer)
+                    && !glIsVertexArray(oldVertexArray) && !glIsBuffer(oldVertexBuffer)
+                    && !glIsTexture(oldTexture) && !glIsTexture(oldTarget), "deleted GPU object is still live"));
             if (hadObjects) cleanup.run(() -> checkGl("GPU object release"));
             cleanup.finish();
         }
@@ -467,14 +489,20 @@ public final class NativeRestorationProbe {
 
     private static final class AudioResource extends OwnedResource {
         private static final int SAMPLE_RATE = 16_000;
+        private static final int RENDER_FRAMES = 2048;
+        private final boolean loopback;
         private final short[] pcm = new short[4096];
         private long device;
         private long context;
         private int buffer;
         private int source;
+        private int verificationSource;
+        private int sampleOffset = 128;
         private boolean wasPlaying = true;
+        private float[] referenceRender;
 
-        AudioResource() {
+        AudioResource(boolean loopback) {
+            this.loopback = loopback;
             for (int i = 0; i < pcm.length; i++) pcm[i] = (short) (Math.sin(2 * Math.PI * 440 * i / SAMPLE_RATE) * 2048);
         }
 
@@ -483,7 +511,10 @@ public final class NativeRestorationProbe {
             owner();
             if (source != 0) {
                 wasPlaying = alGetSourcei(source, AL_SOURCE_STATE) == AL_PLAYING;
-                alSourceStop(source);
+                // Freeze a real device's asynchronous mixer before recording the playback cursor.
+                alSourcePause(source);
+                sampleOffset = alGetSourcei(source, AL_SAMPLE_OFFSET);
+                // Keep it paused so a preparation rollback can resume the existing source at this cursor.
             }
             checkAl("audio quiescence");
         }
@@ -491,6 +522,9 @@ public final class NativeRestorationProbe {
         @Override public void resume() {
             owner();
             if (wasPlaying && source != 0) alSourcePlay(source);
+            // OpenAL reports zero while a source is AL_INITIAL, even after an offset has been queued.
+            if (loopback && wasPlaying && source != 0) require(alGetSourcei(source, AL_SAMPLE_OFFSET) == sampleOffset,
+                    "audio playback position was not restored on resume");
             checkAl("audio playback resume");
         }
 
@@ -498,10 +532,23 @@ public final class NativeRestorationProbe {
             owner();
             require(released(), "OpenAL restore requires released handles");
             try (MemoryStack stack = MemoryStack.stackPush()) {
-                device = alcOpenDevice((ByteBuffer) null);
-                require(device != 0, "OpenAL device unavailable; configure a real device or explicit test ALSOFT_DRIVERS=null");
+                if (loopback) {
+                    require(ALC.createCapabilities(0).ALC_SOFT_loopback, "OpenAL Soft loopback extension unavailable");
+                    device = alcLoopbackOpenDeviceSOFT((ByteBuffer) null);
+                } else {
+                    device = alcOpenDevice((ByteBuffer) null);
+                }
+                require(device != 0, loopback ? "OpenAL loopback device creation failed"
+                        : "OpenAL device unavailable; configure a real device or explicit test ALSOFT_DRIVERS=null");
                 ALCCapabilities capabilities = ALC.createCapabilities(device);
-                context = alcCreateContext(device, (IntBuffer) null);
+                IntBuffer attributes = null;
+                if (loopback) {
+                    require(capabilities.ALC_SOFT_loopback && alcIsRenderFormatSupportedSOFT(device, SAMPLE_RATE, ALC_MONO_SOFT, ALC_FLOAT_SOFT),
+                            "OpenAL loopback does not support the requested mono float format");
+                    attributes = stack.ints(ALC_FREQUENCY, SAMPLE_RATE, ALC_FORMAT_CHANNELS_SOFT, ALC_MONO_SOFT,
+                            ALC_FORMAT_TYPE_SOFT, ALC_FLOAT_SOFT, 0);
+                }
+                context = alcCreateContext(device, attributes);
                 require(context != 0, "OpenAL context creation failed: 0x" + Integer.toHexString(alcGetError(device)));
                 require(alcMakeContextCurrent(context), "OpenAL context could not become current");
                 AL.createCapabilities(capabilities);
@@ -511,16 +558,18 @@ public final class NativeRestorationProbe {
                 alSourcei(source, AL_BUFFER, buffer);
                 alSourcei(source, AL_LOOPING, AL_TRUE);
                 alSourcef(source, AL_GAIN, 0.0f);
+                alSourcei(source, AL_SAMPLE_OFFSET, sampleOffset);
                 checkAl("audio PCM/source restoration");
                 System.out.println("NATIVE_PROBE AL device=" + alcGetString(device, ALC_DEVICE_SPECIFIER)
-                        + " renderer=" + alGetString(AL_RENDERER) + " pcm-hash=" + Arrays.hashCode(pcm));
+                        + " renderer=" + alGetString(AL_RENDERER) + " pcm-hash=" + Arrays.hashCode(pcm)
+                        + " restored-sample-offset=" + sampleOffset);
             } catch (Throwable cause) {
                 releaseAfterFailure(this, cause);
                 rethrow(cause);
             }
         }
 
-        void verify() {
+        void verify() throws Exception {
             owner();
             require(device != 0 && context != 0 && alcGetCurrentContext() == context, "restored OpenAL context is not current");
             require(alIsBuffer(buffer) && alIsSource(source), "restored OpenAL object is invalid");
@@ -531,24 +580,101 @@ public final class NativeRestorationProbe {
                     "restored source attachment/loop state differs");
             require(alGetSourcei(source, AL_SOURCE_STATE) == AL_PLAYING, "restored audio source is not playing");
             require(alGetSourcef(source, AL_GAIN) == 0.0f, "probe source should remain muted");
+            if (loopback) {
+                require(alGetSourcei(source, AL_SAMPLE_OFFSET) == sampleOffset, "loopback playback offset changed without rendering");
+                verifyRenderedSamples();
+            }
+            if (AL.getCapabilities().AL_SOFT_buffer_samples) {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    ShortBuffer samples = stack.mallocShort(pcm.length);
+                    alGetBufferSamplesSOFT(buffer, 0, pcm.length, AL_MONO_SOFT, AL_SHORT_SOFT, samples);
+                    checkAl("audio PCM buffer readback");
+                    for (int i = 0; i < pcm.length; i++) require(samples.get(i) == pcm[i], "restored PCM differs at sample " + i);
+                }
+            }
             checkAl("audio state verification");
             require(alcGetError(device) == ALC_NO_ERROR, "OpenAL device reported an error");
         }
 
+        private void verifyRenderedSamples() throws Exception {
+            Throwable failure = null;
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                // The main source stays muted. A new source makes the mixer/resampler input repeatable for each generation.
+                verificationSource = alGenSources();
+                require(verificationSource != 0, "audio render verification source allocation failed");
+                alSourcei(verificationSource, AL_BUFFER, buffer);
+                alSourcei(verificationSource, AL_LOOPING, AL_TRUE);
+                alSourcei(verificationSource, AL_SOURCE_RELATIVE, AL_TRUE);
+                alSourcef(verificationSource, AL_GAIN, 0.25f);
+                alSourcePlay(verificationSource);
+                checkAl("audio render verification source setup");
+                FloatBuffer output = stack.mallocFloat(RENDER_FRAMES);
+                alcRenderSamplesSOFT(device, output, RENDER_FRAMES);
+                require(alcGetError(device) == ALC_NO_ERROR, "OpenAL loopback sample rendering failed");
+                float[] rendered = new float[RENDER_FRAMES];
+                output.get(rendered);
+                double energy = 0;
+                for (int i = 0; i < rendered.length; i++) {
+                    require(Float.isFinite(rendered[i]), "nonfinite rendered PCM at sample " + i);
+                    energy += rendered[i] * rendered[i];
+                    if (referenceRender != null) require(Math.abs(rendered[i] - referenceRender[i]) <= 0.000001f,
+                            "restored audio rendering differs at sample " + i + ": expected=" + referenceRender[i] + " actual=" + rendered[i]);
+                }
+                require(energy > 0.01, "OpenAL loopback rendered silence instead of the uploaded PCM");
+                if (referenceRender == null) referenceRender = rendered;
+                int expectedOffset = (sampleOffset + RENDER_FRAMES) % pcm.length;
+                require(alGetSourcei(source, AL_SAMPLE_OFFSET) == expectedOffset,
+                        "loopback source playback position did not advance by rendered frames");
+                checkAl("audio rendered PCM and playback position verification");
+                System.out.println("NATIVE_PROBE audio-render frames=" + RENDER_FRAMES
+                        + " mono-float-hash=" + Arrays.hashCode(rendered) + " energy=" + energy
+                        + " reference-equal=true buffer-readback=" + AL.getCapabilities().AL_SOFT_buffer_samples);
+            } catch (Throwable cause) {
+                failure = cause;
+                rethrow(cause);
+            } finally {
+                int oldVerificationSource = verificationSource;
+                verificationSource = 0;
+                Cleanup cleanup = new Cleanup();
+                if (oldVerificationSource != 0) {
+                    cleanup.run(() -> alSourceStop(oldVerificationSource));
+                    cleanup.run(() -> alDeleteSources(oldVerificationSource));
+                    cleanup.run(() -> require(!alIsSource(oldVerificationSource), "deleted audio verification source is still live"));
+                    cleanup.run(() -> checkAl("audio verification source release"));
+                }
+                if (cleanup.failure != null) {
+                    if (failure != null) failure.addSuppressed(cleanup.failure);
+                    else cleanup.finish();
+                }
+            }
+        }
+
         @Override void release() throws Exception {
             Cleanup cleanup = new Cleanup();
+            int oldVerificationSource = verificationSource; verificationSource = 0;
             int oldSource = source; source = 0;
             int oldBuffer = buffer; buffer = 0;
             long oldContext = context; context = 0;
             long oldDevice = device; device = 0;
+            if (oldVerificationSource != 0) {
+                cleanup.run(() -> alSourceStop(oldVerificationSource));
+                cleanup.run(() -> alDeleteSources(oldVerificationSource));
+            }
             if (oldSource != 0) {
                 cleanup.run(() -> alSourceStop(oldSource));
                 cleanup.run(() -> alDeleteSources(oldSource));
             }
             if (oldBuffer != 0) cleanup.run(() -> alDeleteBuffers(oldBuffer));
-            if (oldSource != 0 || oldBuffer != 0) cleanup.run(() -> checkAl("OpenAL object release"));
+            if (oldSource != 0 || oldBuffer != 0 || oldVerificationSource != 0) {
+                cleanup.run(() -> require((oldSource == 0 || !alIsSource(oldSource))
+                        && (oldVerificationSource == 0 || !alIsSource(oldVerificationSource))
+                        && (oldBuffer == 0 || !alIsBuffer(oldBuffer)),
+                        "deleted OpenAL object is still live"));
+                cleanup.run(() -> checkAl("OpenAL object release"));
+            }
             if (oldContext != 0) {
                 cleanup.run(() -> require(alcMakeContextCurrent(0), "OpenAL context could not be detached"));
+                cleanup.run(() -> require(alcGetCurrentContext() == 0, "released OpenAL context remains current"));
                 cleanup.run(() -> AL.setCurrentThread(null));
                 cleanup.run(() -> AL.setCurrentProcess(null));
                 cleanup.run(() -> alcDestroyContext(oldContext));
@@ -560,7 +686,7 @@ public final class NativeRestorationProbe {
             cleanup.finish();
         }
 
-        boolean released() { return device == 0 && context == 0 && buffer == 0 && source == 0; }
+        boolean released() { return device == 0 && context == 0 && buffer == 0 && source == 0 && verificationSource == 0; }
     }
 
     private static void checkGl(String operation) {

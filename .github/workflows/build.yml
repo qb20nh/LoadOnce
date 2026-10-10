@@ -27,6 +27,23 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: real Leyden smoke
         run: python3 tests/smoke_leyden.py
+      - name: software graphics and rendered audio smoke
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libglx-mesa0
+          tools/native-smoke.sh
+      - name: native restoration failure cleanup
+        run: |
+          if tools/native-smoke.sh -- nativeRestorationProbe -PloadonceAudioLoopback=true -PloadonceInvalidShader=true > build/native-failure.log 2>&1; then
+            cat build/native-failure.log
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          output = Path('build/native-failure.log').read_text()
+          for required in ('coordinator-state=STOPPED', 'failure-stop-verified=true', 'cleanup=tracked-handles-zero native-release=ok'):
+              assert required in output, output
+          PY
       - name: capture build artifacts
         uses: actions/upload-artifact@v7
         with:

@@ -24,10 +24,25 @@ import tempfile
 import urllib.parse
 import zipfile
 
-SCHEMA = 1
-JVM_ENV = ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")
+SCHEMA = 2  # Reject archives trained before credential-environment safeguards.
+JVM_ENV = ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "JDK_AOT_VM_OPTIONS")
 NATIVE_ENV = ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES")
 FINGERPRINT_ENV = JVM_ENV + NATIVE_ENV + ("CLASSPATH",)
+# Explicit names avoid treating unrelated session/configuration variables as secrets.
+# This cannot discover credentials an arbitrary application reads from files or custom variables.
+CREDENTIAL_ENV = frozenset({
+    "TOKEN", "ACCESS_TOKEN", "AUTH_TOKEN", "REFRESH_TOKEN", "SESSION_TOKEN", "API_KEY",
+    "PASSWORD", "CLIENT_SECRET", "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT", "GITLAB_TOKEN",
+    "CI_JOB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_OAUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN", "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY", "MINECRAFT_ACCESS_TOKEN", "MC_ACCESS_TOKEN", "MICROSOFT_ACCESS_TOKEN",
+    "MS_ACCESS_TOKEN", "XBOX_TOKEN", "XSTS_TOKEN", "DISCORD_TOKEN", "NPM_TOKEN", "SSH_AUTH_SOCK",
+})
+PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+PROXY_CREDENTIAL = re.compile(r"://[^/\s@]+@")
+NATIVE_PATH_OPTIONS = ("-Djava.library.path=", "-Dorg.lwjgl.librarypath=")
 SECRET = re.compile(
     r"(?i)(?:(?:access|refresh|auth|id).?token|jwt|authorization|session(?:.?token|.?id)?|password|passwd|secret|"
     r"credential|api.?key|bearer|(?:^|[-_.])auth(?:entication)?(?:[-_.=:]|$)|"
@@ -106,6 +121,8 @@ def executable(value: str) -> str:
 def sensitive(command: list[str]) -> bool:
     return any(SECRET.search(value) for value in command[1:]) or any(
         SECRET.search(os.environ.get(key, "")) for key in JVM_ENV
+    ) or any(value and key.upper() in CREDENTIAL_ENV for key, value in os.environ.items()) or any(
+        PROXY_CREDENTIAL.search(os.environ.get(key, "")) for key in PROXY_ENV
     )
 
 
@@ -190,8 +207,10 @@ def launch_inputs(command: list[str]) -> tuple[list[Path], bool]:
             if index >= len(args):
                 raise CacheError("incomplete Java module path option")
             path_list(args[index])
-        elif value.startswith(("--module-path=", "--upgrade-module-path=", "-Djava.library.path=")):
+        elif value.startswith(("--module-path=", "--upgrade-module-path=", *NATIVE_PATH_OPTIONS)):
             path_list(value.split("=", 1)[1])
+        elif value.startswith("-Dorg.lwjgl.system.SharedLibraryExtractPath="):
+            paths.append(Path(value.split("=", 1)[1]))
         elif value == "--patch-module":
             index += 1
             if index >= len(args) or "=" not in args[index]:
@@ -373,7 +392,7 @@ def _sync(path: Path) -> None:
 
 def train(command: list[str], root_path: Path, inputs: list[Path], force_sensitive: bool = False) -> int:
     if force_sensitive or sensitive(command):
-        raise CacheError("training with sensitive launch options is disabled; use ordinary run")
+        raise CacheError("training with sensitive launch inputs or credential environments is disabled; use ordinary run")
     _, unsupported_directory = launch_inputs(command)
     if unsupported_directory:
         raise CacheError("JDK AOT training requires JAR classpaths; nonempty directories are unsupported")
@@ -431,7 +450,7 @@ def train(command: list[str], root_path: Path, inputs: list[Path], force_sensiti
 
 def run(command: list[str], root_path: Path, inputs: list[Path], force_sensitive: bool = False) -> int:
     if force_sensitive or sensitive(command):
-        message("sensitive launch options: ordinary startup")
+        message("sensitive launch inputs: ordinary startup")
         return subprocess.run(command).returncode
     # Fallback is decided before starting Java. A cached child is never replayed.
     with contextlib.ExitStack() as stack:
