@@ -2,7 +2,7 @@
 
 LoadOnce is a prototype for reusing JVM initialization and reconstructing external resources. The current checkout contains a Fabric 26.3 test target, a loader-independent checkpoint lifecycle library, a Linux JVM command wrapper, and an isolated LWJGL restoration probe.
 
-The prototype does not yet restore Minecraft to its main menu or create reusable Minecraft process images. The Fabric entrypoints remain the original test target. In particular, Minecraft 26.3 uses SDL; the GLFW probe exercises the reconstruction design independently of that renderer.
+An opt-in Fabric diagnostic now verifies conventional startup to Minecraft's rendered main menu, including completed GPU readback. Minecraft 26.3 uses SDL/RenderPearl with OpenGL and Vulkan backends; the GLFW restoration probe exercises reconstruction independently. Reusable Minecraft process images and SDL restoration are still unimplemented.
 
 ## Build and contract checks
 
@@ -55,6 +55,15 @@ The wrapper defaults to ten cycles and `-PloadonceAudioLoopback=true`. OpenAL So
 
 The wrapper uses an authenticated temporary X11 display and cleans up its processes and private directories. It requires `Xvfb`, `xauth`, `setsid`, and Mesa. Set `LOADONCE_XVFB` or use `--xvfb` for an extracted binary. With an existing display, `bash ./gradlew nativeRestorationProbe -PloadonceAudioLoopback=true` runs the same PCM checks. The default device path and `ALSOFT_DRIVERS=null` remain supported. Software rendering and loopback audio do not establish hardware GPU or physical audio restoration; real keyboard/mouse interaction and controllers also need additional checks.
 
+To change settings before each boundary and verify their reconstruction:
+
+```sh
+tools/native-smoke.sh --xvfb /path/to/Xvfb -- nativeRestorationProbe \
+  -PloadonceCycles=10 -PloadonceAudioLoopback=true -PloadonceReconfigure=true
+```
+
+Quiescence reads actual window dimensions, position, visibility, resizability, cursor/input modes, close flag and GLFW clock. Audio snapshots the source's gain, looping mode, playing/paused/stopped state and frozen sample cursor. Changed loopback sources must render PCM when playing and silence when paused/stopped; the ten-cycle scenario also checks finite-buffer exhaustion. A separate reference render still checks sample equality. Physical playback cursors advance asynchronously.
+
 The failure probe must exit unsuccessfully after an invalid shader interrupts restoration. Its output must include `coordinator-state=STOPPED`, `failure-stop-verified=true`, and `cleanup=tracked-handles-zero native-release=ok`:
 
 ```sh
@@ -67,10 +76,39 @@ To test an actual native process image with a minimal environment:
 bash ./gradlew writeNativeProbeClasspath
 tools/native-smoke.sh --xvfb /path/to/Xvfb --command \
   python3 tools/smoke_crac.py --java /path/to/crac-jdk/bin/java \
-  --native-classpath-file build/native-probe-classpath.txt
+  --native-classpath-file build/native-probe-classpath.txt --native-reconfigure
 ```
 
 This test requires the selected runtime to accept all resources after teardown and complete new-process reconstruction. See the continuation notes for current native image evidence and remaining blockers. The `--command` mode preserves argument boundaries and returns the driver's status.
+
+## Private fixture images and fallback
+
+`tools/crac_fixture.py` adds explicit capture and prelaunch validation for the CPU and native fixtures. It fingerprints the runtime, kernel, classpath/manifest dependencies, fixed fixture arguments, display/authentication configuration and caller-declared native providers. Its private atomic manifest covers image bytes and extracted LWJGL libraries. Missing, corrupt, incompatible or busy images select one cold fixture launch. A failed restore is returned without replay.
+
+After `build`, write a file containing the absolute standalone runtime JAR path, then capture/run the CPU fixture:
+
+```sh
+realpath build/libs/*-runtime.jar > build/crac-fixture-classpath.txt
+python3 tools/crac_fixture.py capture --java /path/to/crac-jdk/bin/java \
+  --cache-dir build/fixture-cache --classpath-file build/crac-fixture-classpath.txt
+python3 tools/crac_fixture.py run --java /path/to/crac-jdk/bin/java \
+  --cache-dir build/fixture-cache --classpath-file build/crac-fixture-classpath.txt
+```
+
+For the native fixture, use `build/native-probe-classpath.txt`, `--native --reconfigure`, and repeated `--input` for external graphics/windowing provider files or directories. Keep the same authenticated display alive for capture and restores. A newly allocated display or changed Xauthority selects cold startup. Provider discovery is caller-owned; undeclared host libraries are not automatically detected. This launcher accepts only these isolated fixtures, not Minecraft or an arbitrary application command.
+
+## Minecraft rendered-menu diagnostic
+
+The diagnostic is disabled by default. On a configured display, opt in with:
+
+```sh
+bash ./gradlew runClient -PloadonceMenuProbe=true -PloadonceMenuScreenshot=true \
+  -PloadonceMenuGameDir=build/menu-probe/game -PloadonceMenuTimeout=120
+```
+
+It requires a loaded `TitleScreen` with opaque active widgets, no overlay/world/connection, consecutive extraction and successful presentation of three frames, and completed nonuniform GPU framebuffer readback. Optional PNGs are written inside the selected game directory's `loadonce-menu-probe/`. A fresh test directory needs the ordinary `onboardAccessibility:false` option to skip first-run accessibility onboarding.
+
+Judge success by `LOADONCE_MENU_PROBE_PASSED` and absence of `LOADONCE_MENU_PROBE_FAILED`; a timeout can also stop the game cleanly with exit 0. Keep an outer process deadline for native hangs. The measured software Vulkan client reached the rendered menu; the marker explicitly reports that human input, restoration and checkpointing were not verified. Physical audio and authentication readiness require their own checks.
 
 ## Leyden AOT command wrapper
 

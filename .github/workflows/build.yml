@@ -32,9 +32,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libgl1-mesa-dri libglx-mesa0
           tools/native-smoke.sh
+      - name: runtime-changed window and audio restoration
+        run: tools/native-smoke.sh -- nativeRestorationProbe -PloadonceCycles=10 -PloadonceAudioLoopback=true -PloadonceReconfigure=true
       - name: native restoration failure cleanup
         run: |
-          if tools/native-smoke.sh -- nativeRestorationProbe -PloadonceAudioLoopback=true -PloadonceInvalidShader=true > build/native-failure.log 2>&1; then
+          if tools/native-smoke.sh -- nativeRestorationProbe -PloadonceAudioLoopback=true -PloadonceReconfigure=true -PloadonceInvalidShader=true > build/native-failure.log 2>&1; then
             cat build/native-failure.log
             exit 1
           fi

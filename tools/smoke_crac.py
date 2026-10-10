@@ -67,10 +67,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60, help="per-process deadline in seconds (1..60)")
     parser.add_argument("--native-classpath-file", type=Path,
                         help="build/native-probe-classpath.txt from writeNativeProbeClasspath")
+    parser.add_argument("--native-reconfigure", action="store_true",
+                        help="verify runtime-changed window/input/audio settings in the native fixture")
     parser.add_argument("--skip-failure-cases", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.restores <= 10 or not 1 <= args.timeout <= 60:
         parser.error("restores must be 1..10 and timeout must be 1..60")
+    if args.native_reconfigure and args.native_classpath_file is None:
+        parser.error("--native-reconfigure requires --native-classpath-file")
     if not Path("/proc/self/stat").is_file():
         parser.error("this process-identity check requires Linux /proc")
     java = args.java.resolve(strict=True)
@@ -144,6 +148,8 @@ def main() -> int:
         base.append("--enable-native-access=ALL-UNNAMED")
         application = ["-cp", classpath, "dev.loadonce.prototype.NativeRestorationProbe",
                        "--cycles=1", "--crac", "--audio-loopback"]
+        if args.native_reconfigure:
+            application.append("--reconfigure")
     image = directory / "image"
     image.mkdir(mode=0o700)
     checkpoint_log = directory / "checkpoint.log"

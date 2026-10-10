@@ -14,8 +14,8 @@ public final class CracSmoke {
 
     public static void main(String[] args) throws Exception {
         String scenario = args.length == 0 ? "success" : args[0];
-        if (args.length > 1 || !Set.of("success", "denied", "prepare-failure", "restore-failure", "descriptor-rejection").contains(scenario)) {
-            throw new IllegalArgumentException("Usage: CracSmoke [success|denied|prepare-failure|restore-failure|descriptor-rejection]");
+        if (args.length > 1 || !Set.of("cold", "success", "denied", "prepare-failure", "restore-failure", "descriptor-rejection").contains(scenario)) {
+            throw new IllegalArgumentException("Usage: CracSmoke [cold|success|denied|prepare-failure|restore-failure|descriptor-rejection]");
         }
         // Read the kernel's PID, rather than relying on a cached Java process handle.
         // The clean smoke driver compares this with its actual restored child PID.
@@ -25,6 +25,11 @@ public final class CracSmoke {
                         : CheckpointGate.Decision.allow("isolated fixture; launcher must exclude credentials from environment"));
         SmokeResource resource = new SmokeResource(scenario);
         coordinator.register(resource);
+        if (scenario.equals("cold")) {
+            System.out.println("CRAC_SMOKE COLD pid=" + initialPid + " heap-witness=" + resource.witness
+                    + " value=" + resource.value + " coordinator-state=" + coordinator.state());
+            return;
+        }
         CracBridge bridge = CracBridge.install(coordinator);
         System.out.println("CRAC_SMOKE initial-pid=" + initialPid + " heap-witness=" + resource.witness);
         System.out.println("Invoking real jdk.crac.Core.checkpointRestore; engine behavior depends on VM flags.");

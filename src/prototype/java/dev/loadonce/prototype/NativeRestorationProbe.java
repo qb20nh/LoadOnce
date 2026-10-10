@@ -43,6 +43,7 @@ public final class NativeRestorationProbe {
         boolean invalidShaderOnRestore = false;
         boolean crac = false;
         boolean audioLoopback = false;
+        boolean reconfigure = false;
         for (String arg : args) {
             if (arg.startsWith("--cycles=")) {
                 cycles = Integer.parseInt(arg.substring("--cycles=".length()));
@@ -52,8 +53,10 @@ public final class NativeRestorationProbe {
                 crac = true;
             } else if (arg.equals("--audio-loopback")) {
                 audioLoopback = true;
+            } else if (arg.equals("--reconfigure")) {
+                reconfigure = true;
             } else {
-                throw new IllegalArgumentException("Usage: NativeRestorationProbe [--cycles=1..100] [--crac] [--audio-loopback] [--invalid-shader-on-restore]");
+                throw new IllegalArgumentException("Usage: NativeRestorationProbe [--cycles=1..100] [--crac] [--audio-loopback] [--reconfigure] [--invalid-shader-on-restore]");
             }
         }
         require(cycles >= 1 && cycles <= 100, "cycles must be between 1 and 100");
@@ -66,7 +69,7 @@ public final class NativeRestorationProbe {
 
         WindowResource window = new WindowResource();
         GraphicsResource graphics = new GraphicsResource(window, invalidShaderOnRestore);
-        AudioResource audio = new AudioResource(audioLoopback);
+        AudioResource audio = new AudioResource(audioLoopback, reconfigure);
         CheckpointCoordinator coordinator = new CheckpointCoordinator(
                 () -> CheckpointGate.Decision.allow("Isolated native probe has CPU descriptors and no sessions or world state"));
         coordinator.register(window);
@@ -81,6 +84,10 @@ public final class NativeRestorationProbe {
             audio.resume();
             verify(window, graphics, audio, 0);
             for (int cycle = 1; cycle <= cycles; cycle++) {
+                if (reconfigure) {
+                    window.reconfigure(cycle);
+                    audio.reconfigure(cycle);
+                }
                 if (bridge == null) {
                     coordinator.prepareCheckpoint();
                     assertReleased(window, graphics, audio);
@@ -167,14 +174,16 @@ public final class NativeRestorationProbe {
         private GLFWWindowCloseCallback closeCallback;
         private int sizeEvents;
         private int framebufferEvents;
-        private double checkpointTime;
+        private WindowDescriptor descriptor = new WindowDescriptor(WIDTH, HEIGHT, 20, 30, GLFW_TRUE, GLFW_TRUE,
+                GLFW_CURSOR_NORMAL, GLFW_TRUE, GLFW_FALSE, GLFW_FALSE, false, 0);
         private String lastError = "no GLFW error reported";
 
         @Override public String id() { return "glfw-window-context-callbacks"; }
 
         @Override public void quiesce() {
             owner();
-            checkpointTime = glfwGetTime();
+            descriptor = snapshot();
+            System.out.println("NATIVE_PROBE window-snapshot=" + descriptor);
         }
 
         @Override public void restore() throws Exception {
@@ -187,22 +196,24 @@ public final class NativeRestorationProbe {
                 require(glfwInit(), "GLFW initialization failed; configure a display: " + lastError);
                 initialized = true;
                 // GLFW initialization resets its timer. Keep the application clock at the quiesced boundary.
-                glfwSetTime(checkpointTime);
+                glfwSetTime(descriptor.elapsedTime());
                 glfwDefaultWindowHints();
                 glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
                 glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
                 glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-                glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-                glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-                handle = glfwCreateWindow(WIDTH, HEIGHT, "LoadOnce native restoration probe", 0, 0);
+                glfwWindowHint(GLFW_VISIBLE, descriptor.visible());
+                glfwWindowHint(GLFW_RESIZABLE, descriptor.resizable());
+                handle = glfwCreateWindow(descriptor.width(), descriptor.height(), "LoadOnce native restoration probe", 0, 0);
                 require(handle != 0, "GLFW OpenGL 3.3 window creation failed: " + lastError);
                 glfwMakeContextCurrent(handle);
                 glfwSwapInterval(0);
                 GL.createCapabilities();
-                glfwSetWindowPos(handle, 20, 30);
-                glfwSetInputMode(handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-                glfwSetInputMode(handle, GLFW_STICKY_KEYS, GLFW_TRUE);
-                glfwSetWindowShouldClose(handle, false);
+                glfwSetWindowPos(handle, descriptor.x(), descriptor.y());
+                glfwSetInputMode(handle, GLFW_CURSOR, descriptor.cursor());
+                glfwSetInputMode(handle, GLFW_STICKY_KEYS, descriptor.stickyKeys());
+                glfwSetInputMode(handle, GLFW_STICKY_MOUSE_BUTTONS, descriptor.stickyMouse());
+                glfwSetInputMode(handle, GLFW_LOCK_KEY_MODS, descriptor.lockKeyMods());
+                glfwSetWindowShouldClose(handle, descriptor.closeRequested());
                 sizeCallback = GLFWWindowSizeCallback.create((window, width, height) -> sizeEvents++);
                 glfwSetWindowSizeCallback(handle, sizeCallback);
                 framebufferCallback = GLFWFramebufferSizeCallback.create((window, width, height) -> framebufferEvents++);
@@ -225,12 +236,7 @@ public final class NativeRestorationProbe {
         void verify() {
             owner();
             require(handle != 0 && glfwGetCurrentContext() == handle, "GLFW context is not current");
-            require(glfwGetTime() >= checkpointTime, "GLFW elapsed timer regressed across restoration");
-            require(glfwGetWindowAttrib(handle, GLFW_VISIBLE) == GLFW_TRUE, "window visibility was not restored");
-            require(glfwGetWindowAttrib(handle, GLFW_RESIZABLE) == GLFW_TRUE, "window resizability was not restored");
-            require(glfwGetInputMode(handle, GLFW_CURSOR) == GLFW_CURSOR_NORMAL, "cursor mode was not restored");
-            require(glfwGetInputMode(handle, GLFW_STICKY_KEYS) == GLFW_TRUE, "sticky-key mode was not restored");
-            require(!glfwWindowShouldClose(handle), "window unexpectedly requests close");
+            verifySettings(descriptor);
             // The native setters return the actually installed function pointers. Do not invoke mock callbacks.
             sameCallback(glfwSetWindowSizeCallback(handle, sizeCallback), sizeCallback, "window size");
             sameCallback(glfwSetFramebufferSizeCallback(handle, framebufferCallback), framebufferCallback, "framebuffer size");
@@ -241,26 +247,76 @@ public final class NativeRestorationProbe {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 IntBuffer width = stack.mallocInt(1);
                 IntBuffer height = stack.mallocInt(1);
-                IntBuffer x = stack.mallocInt(1);
-                IntBuffer y = stack.mallocInt(1);
-                glfwGetWindowSize(handle, width, height);
-                require(width.get(0) == WIDTH && height.get(0) == HEIGHT, "window dimensions were not restored");
-                glfwGetWindowPos(handle, x, y);
-                require(x.get(0) == 20 && y.get(0) == 30, "window position was not restored");
                 glfwGetFramebufferSize(handle, width, height);
                 require(width.get(0) > 0 && height.get(0) > 0, "restored framebuffer is empty");
             }
             glfwPollEvents();
             int previousSizeEvents = sizeEvents;
             int previousFramebufferEvents = framebufferEvents;
-            glfwSetWindowSize(handle, WIDTH + 8, HEIGHT + 8);
+            glfwSetWindowSize(handle, descriptor.width() + 8, descriptor.height() + 8);
             awaitEvents(() -> sizeEvents > previousSizeEvents && framebufferEvents > previousFramebufferEvents,
                     "native resize/framebuffer callbacks were not delivered");
             int beforeReturn = sizeEvents;
-            glfwSetWindowSize(handle, WIDTH, HEIGHT);
+            glfwSetWindowSize(handle, descriptor.width(), descriptor.height());
             awaitEvents(() -> sizeEvents > beforeReturn, "native callback did not observe restored window dimensions");
             glfwSwapBuffers(handle);
         }
+
+        void reconfigure(int cycle) {
+            owner();
+            boolean alternate = (cycle & 1) == 0;
+            int width = WIDTH + 12 * (1 + cycle % 4);
+            int height = HEIGHT + 8 * (1 + cycle % 3);
+            int x = 40 + 7 * (cycle % 5);
+            int y = 50 + 9 * (cycle % 4);
+            int cursor = alternate ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_HIDDEN;
+            int stickyKeys = alternate ? GLFW_TRUE : GLFW_FALSE;
+            int stickyMouse = alternate ? GLFW_FALSE : GLFW_TRUE;
+            int lockKeyMods = alternate ? GLFW_TRUE : GLFW_FALSE;
+            glfwSetWindowSize(handle, width, height);
+            glfwSetWindowPos(handle, x, y);
+            glfwSetWindowAttrib(handle, GLFW_RESIZABLE, alternate ? GLFW_TRUE : GLFW_FALSE);
+            glfwSetInputMode(handle, GLFW_CURSOR, cursor);
+            glfwSetInputMode(handle, GLFW_STICKY_KEYS, stickyKeys);
+            glfwSetInputMode(handle, GLFW_STICKY_MOUSE_BUTTONS, stickyMouse);
+            glfwSetInputMode(handle, GLFW_LOCK_KEY_MODS, lockKeyMods);
+            glfwSetTime(10 + cycle * 2.5);
+            glfwPollEvents();
+            WindowDescriptor requested = new WindowDescriptor(width, height, x, y, GLFW_TRUE,
+                    alternate ? GLFW_TRUE : GLFW_FALSE, cursor, stickyKeys, stickyMouse, lockKeyMods, false, 10 + cycle * 2.5);
+            verifySettings(requested);
+            System.out.println("NATIVE_PROBE window-reconfigured cycle=" + cycle + " settings=" + requested);
+        }
+
+        private WindowDescriptor snapshot() {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                IntBuffer first = stack.mallocInt(1);
+                IntBuffer second = stack.mallocInt(1);
+                glfwGetWindowSize(handle, first, second);
+                int width = first.get(0);
+                int height = second.get(0);
+                glfwGetWindowPos(handle, first, second);
+                return new WindowDescriptor(width, height, first.get(0), second.get(0),
+                        glfwGetWindowAttrib(handle, GLFW_VISIBLE), glfwGetWindowAttrib(handle, GLFW_RESIZABLE),
+                        glfwGetInputMode(handle, GLFW_CURSOR), glfwGetInputMode(handle, GLFW_STICKY_KEYS),
+                        glfwGetInputMode(handle, GLFW_STICKY_MOUSE_BUTTONS), glfwGetInputMode(handle, GLFW_LOCK_KEY_MODS),
+                        glfwWindowShouldClose(handle), glfwGetTime());
+            }
+        }
+
+        private void verifySettings(WindowDescriptor expected) {
+            WindowDescriptor actual = snapshot();
+            require(actual.elapsedTime() >= expected.elapsedTime(), "GLFW elapsed timer regressed across restoration");
+            require(actual.width() == expected.width() && actual.height() == expected.height(), "window dimensions differ: " + actual);
+            require(actual.x() == expected.x() && actual.y() == expected.y(), "window position differs: " + actual);
+            require(actual.visible() == expected.visible() && actual.resizable() == expected.resizable(), "window attributes differ: " + actual);
+            require(actual.cursor() == expected.cursor() && actual.stickyKeys() == expected.stickyKeys()
+                    && actual.stickyMouse() == expected.stickyMouse() && actual.lockKeyMods() == expected.lockKeyMods(), "window input modes differ: " + actual);
+            require(actual.closeRequested() == expected.closeRequested(), "window close state differs");
+        }
+
+        private record WindowDescriptor(int width, int height, int x, int y, int visible, int resizable,
+                int cursor, int stickyKeys, int stickyMouse, int lockKeyMods, boolean closeRequested, double elapsedTime) {}
 
         private void awaitEvents(BooleanSupplier condition, String message) {
             long deadline = System.nanoTime() + 2_000_000_000L;
@@ -491,18 +547,19 @@ public final class NativeRestorationProbe {
         private static final int SAMPLE_RATE = 16_000;
         private static final int RENDER_FRAMES = 2048;
         private final boolean loopback;
+        private final boolean reconfigure;
         private final short[] pcm = new short[4096];
         private long device;
         private long context;
         private int buffer;
         private int source;
         private int verificationSource;
-        private int sampleOffset = 128;
-        private boolean wasPlaying = true;
+        private AudioDescriptor descriptor = new AudioDescriptor(128, AL_PLAYING, AL_TRUE, 0.0f);
         private float[] referenceRender;
 
-        AudioResource(boolean loopback) {
+        AudioResource(boolean loopback, boolean reconfigure) {
             this.loopback = loopback;
+            this.reconfigure = reconfigure;
             for (int i = 0; i < pcm.length; i++) pcm[i] = (short) (Math.sin(2 * Math.PI * 440 * i / SAMPLE_RATE) * 2048);
         }
 
@@ -510,20 +567,26 @@ public final class NativeRestorationProbe {
         @Override public void quiesce() {
             owner();
             if (source != 0) {
-                wasPlaying = alGetSourcei(source, AL_SOURCE_STATE) == AL_PLAYING;
+                int state = alGetSourcei(source, AL_SOURCE_STATE);
                 // Freeze a real device's asynchronous mixer before recording the playback cursor.
-                alSourcePause(source);
-                sampleOffset = alGetSourcei(source, AL_SAMPLE_OFFSET);
+                if (state == AL_PLAYING) {
+                    alSourcePause(source);
+                    // A nonlooping device can finish between the state query and pause; do not restart it at frame zero.
+                    if (alGetSourcei(source, AL_SOURCE_STATE) == AL_STOPPED) state = AL_STOPPED;
+                }
+                descriptor = new AudioDescriptor(alGetSourcei(source, AL_SAMPLE_OFFSET), state,
+                        alGetSourcei(source, AL_LOOPING), alGetSourcef(source, AL_GAIN));
                 // Keep it paused so a preparation rollback can resume the existing source at this cursor.
+                System.out.println("NATIVE_PROBE audio-snapshot=" + descriptor);
             }
             checkAl("audio quiescence");
         }
 
         @Override public void resume() {
             owner();
-            if (wasPlaying && source != 0) alSourcePlay(source);
+            if (descriptor.state() == AL_PLAYING && source != 0) alSourcePlay(source);
             // OpenAL reports zero while a source is AL_INITIAL, even after an offset has been queued.
-            if (loopback && wasPlaying && source != 0) require(alGetSourcei(source, AL_SAMPLE_OFFSET) == sampleOffset,
+            if (loopback && descriptor.state() == AL_PLAYING && source != 0) require(alGetSourcei(source, AL_SAMPLE_OFFSET) == descriptor.sampleOffset(),
                     "audio playback position was not restored on resume");
             checkAl("audio playback resume");
         }
@@ -556,13 +619,23 @@ public final class NativeRestorationProbe {
                 alBufferData(buffer, AL_FORMAT_MONO16, stack.shorts(pcm), SAMPLE_RATE);
                 source = alGenSources();
                 alSourcei(source, AL_BUFFER, buffer);
-                alSourcei(source, AL_LOOPING, AL_TRUE);
+                alSourcei(source, AL_LOOPING, descriptor.looping());
+                // Prime the state silently; an asynchronous device must not emit frames from cursor zero.
                 alSourcef(source, AL_GAIN, 0.0f);
-                alSourcei(source, AL_SAMPLE_OFFSET, sampleOffset);
+                if (descriptor.state() == AL_PLAYING || descriptor.state() == AL_PAUSED) {
+                    // AL_INITIAL hides a queued offset. Reconstruct PAUSED explicitly and assign the frozen cursor last.
+                    alSourcePlay(source);
+                    alSourcePause(source);
+                } else if (descriptor.state() == AL_STOPPED) {
+                    alSourcePlay(source);
+                    alSourceStop(source);
+                }
+                alSourcei(source, AL_SAMPLE_OFFSET, descriptor.sampleOffset());
+                alSourcef(source, AL_GAIN, descriptor.gain());
                 checkAl("audio PCM/source restoration");
                 System.out.println("NATIVE_PROBE AL device=" + alcGetString(device, ALC_DEVICE_SPECIFIER)
                         + " renderer=" + alGetString(AL_RENDERER) + " pcm-hash=" + Arrays.hashCode(pcm)
-                        + " restored-sample-offset=" + sampleOffset);
+                        + " restored-source=" + descriptor);
             } catch (Throwable cause) {
                 releaseAfterFailure(this, cause);
                 rethrow(cause);
@@ -576,13 +649,16 @@ public final class NativeRestorationProbe {
             require(alGetBufferi(buffer, AL_SIZE) == pcm.length * Short.BYTES, "restored PCM buffer size differs");
             require(alGetBufferi(buffer, AL_FREQUENCY) == SAMPLE_RATE && alGetBufferi(buffer, AL_BITS) == 16
                     && alGetBufferi(buffer, AL_CHANNELS) == 1, "restored PCM format differs");
-            require(alGetSourcei(source, AL_BUFFER) == buffer && alGetSourcei(source, AL_LOOPING) == AL_TRUE,
+            require(alGetSourcei(source, AL_BUFFER) == buffer && alGetSourcei(source, AL_LOOPING) == descriptor.looping(),
                     "restored source attachment/loop state differs");
-            require(alGetSourcei(source, AL_SOURCE_STATE) == AL_PLAYING, "restored audio source is not playing");
-            require(alGetSourcef(source, AL_GAIN) == 0.0f, "probe source should remain muted");
+            require(alGetSourcei(source, AL_SOURCE_STATE) == descriptor.state(), "restored audio source playback state differs");
+            require(alGetSourcef(source, AL_GAIN) == descriptor.gain(), "restored audio source gain differs");
+            if (descriptor.state() != AL_PLAYING) require(alGetSourcei(source, AL_SAMPLE_OFFSET) == descriptor.sampleOffset(),
+                    "inactive audio source cursor differs");
             if (loopback) {
-                require(alGetSourcei(source, AL_SAMPLE_OFFSET) == sampleOffset, "loopback playback offset changed without rendering");
+                require(alGetSourcei(source, AL_SAMPLE_OFFSET) == descriptor.sampleOffset(), "loopback playback offset changed without rendering");
                 verifyRenderedSamples();
+                if (reconfigure) verifyReconfiguredRendering();
             }
             if (AL.getCapabilities().AL_SOFT_buffer_samples) {
                 try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -598,8 +674,14 @@ public final class NativeRestorationProbe {
 
         private void verifyRenderedSamples() throws Exception {
             Throwable failure = null;
+            int beforeOffset = alGetSourcei(source, AL_SAMPLE_OFFSET);
+            int beforeState = alGetSourcei(source, AL_SOURCE_STATE);
             try (MemoryStack stack = MemoryStack.stackPush()) {
-                // The main source stays muted. A new source makes the mixer/resampler input repeatable for each generation.
+                if (reconfigure) {
+                    if (beforeState == AL_PLAYING) alSourcePause(source);
+                    drainMixer(stack);
+                }
+                // A new source makes the mixer/resampler input repeatable for each generation.
                 verificationSource = alGenSources();
                 require(verificationSource != 0, "audio render verification source allocation failed");
                 alSourcei(verificationSource, AL_BUFFER, buffer);
@@ -622,13 +704,14 @@ public final class NativeRestorationProbe {
                 }
                 require(energy > 0.01, "OpenAL loopback rendered silence instead of the uploaded PCM");
                 if (referenceRender == null) referenceRender = rendered;
-                int expectedOffset = (sampleOffset + RENDER_FRAMES) % pcm.length;
+                int expectedOffset = reconfigure ? beforeOffset : (descriptor.sampleOffset() + RENDER_FRAMES) % pcm.length;
                 require(alGetSourcei(source, AL_SAMPLE_OFFSET) == expectedOffset,
                         "loopback source playback position did not advance by rendered frames");
                 checkAl("audio rendered PCM and playback position verification");
                 System.out.println("NATIVE_PROBE audio-render frames=" + RENDER_FRAMES
                         + " mono-float-hash=" + Arrays.hashCode(rendered) + " energy=" + energy
-                        + " reference-equal=true buffer-readback=" + AL.getCapabilities().AL_SOFT_buffer_samples);
+                        + " reference-equal=" + (referenceRender == rendered ? "baseline" : "true")
+                        + " buffer-readback=" + AL.getCapabilities().AL_SOFT_buffer_samples);
             } catch (Throwable cause) {
                 failure = cause;
                 rethrow(cause);
@@ -648,6 +731,79 @@ public final class NativeRestorationProbe {
                 }
             }
         }
+
+        void reconfigure(int cycle) {
+            owner();
+            alSourcePause(source);
+            if (alGetSourcei(source, AL_SOURCE_STATE) != AL_PAUSED) {
+                alSourcef(source, AL_GAIN, 0.0f);
+                alSourcePlay(source);
+                alSourcePause(source);
+            }
+            int state = cycle % 5 == 0 ? AL_STOPPED : (cycle & 1) == 0 ? AL_PAUSED : AL_PLAYING;
+            boolean exhaust = loopback && cycle % 10 == 9;
+            int looping = !exhaust && cycle % 4 >= 2 ? AL_TRUE : AL_FALSE;
+            float gain = (1 + cycle % 4) * 0.125f;
+            // Explicit rendering makes exhaustion deterministic; physical devices can consume this tail during window verification.
+            int offset = state == AL_STOPPED ? 0 : exhaust ? pcm.length - 512 : 256 + 128 * (cycle % 5);
+            alSourcei(source, AL_LOOPING, looping);
+            alSourcef(source, AL_GAIN, gain);
+            alSourcei(source, AL_SAMPLE_OFFSET, offset);
+            if (state == AL_PLAYING) alSourcePlay(source);
+            else if (state == AL_STOPPED) alSourceStop(source);
+            require(alGetSourcei(source, AL_SOURCE_STATE) == state, "audio runtime state reconfiguration failed");
+            require(alGetSourcei(source, AL_LOOPING) == looping && alGetSourcef(source, AL_GAIN) == gain,
+                    "audio runtime property reconfiguration failed");
+            if (loopback || state != AL_PLAYING) require(alGetSourcei(source, AL_SAMPLE_OFFSET) == offset,
+                    "audio runtime cursor reconfiguration failed");
+            checkAl("audio runtime source reconfiguration");
+            System.out.println("NATIVE_PROBE audio-reconfigured cycle=" + cycle
+                    + " requested=" + new AudioDescriptor(offset, state, looping, gain));
+        }
+
+        private void drainMixer(MemoryStack stack) {
+            // Clear contributions from a stopped verification source or an audible source's previous mix block.
+            FloatBuffer silence = stack.mallocFloat(RENDER_FRAMES);
+            alcRenderSamplesSOFT(device, silence, RENDER_FRAMES);
+            require(alcGetError(device) == ALC_NO_ERROR, "OpenAL mixer drain failed");
+            require(alGetSourcei(source, AL_SAMPLE_OFFSET) == descriptor.sampleOffset(), "paused source advanced during mixer drain");
+        }
+
+        private void verifyReconfiguredRendering() {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                drainMixer(stack);
+                if (descriptor.state() == AL_PLAYING) alSourcePlay(source);
+                FloatBuffer output = stack.mallocFloat(RENDER_FRAMES);
+                alcRenderSamplesSOFT(device, output, RENDER_FRAMES);
+                require(alcGetError(device) == ALC_NO_ERROR, "reconfigured OpenAL source rendering failed");
+                double energy = 0;
+                for (int i = 0; i < output.capacity(); i++) {
+                    float sample = output.get(i);
+                    require(Float.isFinite(sample), "reconfigured audio produced a nonfinite sample");
+                    energy += sample * sample;
+                }
+                boolean playing = descriptor.state() == AL_PLAYING;
+                require(playing && descriptor.gain() > 0 ? energy > 0.01 : energy == 0,
+                        "reconfigured source rendered unexpected energy: " + energy);
+                int expectedOffset = descriptor.sampleOffset();
+                int expectedState = descriptor.state();
+                if (playing) {
+                    if (descriptor.looping() == AL_TRUE) expectedOffset = (expectedOffset + RENDER_FRAMES) % pcm.length;
+                    else if (expectedOffset + RENDER_FRAMES >= pcm.length) {
+                        expectedOffset = 0;
+                        expectedState = AL_STOPPED;
+                    } else expectedOffset += RENDER_FRAMES;
+                }
+                require(alGetSourcei(source, AL_SAMPLE_OFFSET) == expectedOffset,
+                        "reconfigured source playback cursor differs after rendering");
+                require(alGetSourcei(source, AL_SOURCE_STATE) == expectedState, "reconfigured source playback state differs after rendering");
+                checkAl("reconfigured audio rendering verification");
+                System.out.println("NATIVE_PROBE audio-reconfiguration-verified source=" + descriptor
+                        + " frames=" + RENDER_FRAMES + " rendered-energy=" + energy + " cursor=" + expectedOffset + " state=" + expectedState);
+            }
+        }
+
+        private record AudioDescriptor(int sampleOffset, int state, int looping, float gain) {}
 
         @Override void release() throws Exception {
             Cleanup cleanup = new Cleanup();

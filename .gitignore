@@ -42,3 +42,6 @@ replay_*.log
 # Python prototype tools
 __pycache__/
 *.py[cod]
+
+# LWJGL native extraction during standalone probes
+.lwjgl/

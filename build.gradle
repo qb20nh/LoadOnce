@@ -26,6 +26,13 @@ sourceSets {
 
 loom {
 	splitEnvironmentSourceSets()
+	if (providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
+		runs {
+			client {
+				runDir providers.gradleProperty('loadonceMenuGameDir').getOrElse('build/menu-probe/game')
+			}
+		}
+	}
 
 	mods {
 		"modid" {
@@ -76,6 +83,9 @@ tasks.register('nativeRestorationProbe', JavaExec) {
 	if (providers.gradleProperty('loadonceAudioLoopback').getOrElse('false').toBoolean()) {
 		args '--audio-loopback'
 	}
+	if (providers.gradleProperty('loadonceReconfigure').getOrElse('false').toBoolean()) {
+		args '--reconfigure'
+	}
 	if (providers.gradleProperty('loadonceCracJava').isPresent()) {
 		executable = providers.gradleProperty('loadonceCracJava').get()
 	}
@@ -111,6 +121,17 @@ tasks.register('cracSmoke', JavaExec) {
 	if (providers.gradleProperty('loadonceCracEngine').isPresent()) {
 		jvmArgs "-XX:CRaCEngine=${providers.gradleProperty('loadonceCracEngine').get()}",
 				"-XX:CRaCCheckpointTo=${layout.buildDirectory.dir('crac-smoke').get().asFile}"
+	}
+}
+
+tasks.named('runClient', JavaExec) {
+	if (providers.gradleProperty('loadonceMenuProbe').getOrElse('false').toBoolean()) {
+		jvmArgs '-Dloadonce.menuProbe=true', '-Dloadonce.menuProbe.exit=true',
+				"-Dloadonce.menuProbe.frames=${providers.gradleProperty('loadonceMenuFrames').getOrElse('3')}",
+				"-Dloadonce.menuProbe.timeoutSeconds=${providers.gradleProperty('loadonceMenuTimeout').getOrElse('120')}"
+		if (providers.gradleProperty('loadonceMenuScreenshot').getOrElse('false').toBoolean()) {
+			jvmArgs '-Dloadonce.menuProbe.screenshot=true'
+		}
 	}
 }
 
