@@ -31,6 +31,7 @@ public final class ChildProcess {
     private static final long POLL_MILLIS = 25;
     private static final long STOP_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long DESCENDANT_STOP_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
+    private static final long SUPERVISED_SHUTDOWN_NANOS = TimeUnit.MILLISECONDS.toNanos(2500);
 
     private ChildProcess() {
     }
@@ -46,14 +47,27 @@ public final class ChildProcess {
     public static Result run(List<String> command, Path cwd,
                              Map<String, String> environment, Path log,
                              Duration timeout) throws IOException, InterruptedException {
-        return execute(command, cwd, environment, log, null, timeout, true, false);
+        return execute(command, cwd, environment, log, null, timeout, true, false, false);
+    }
+
+    /**
+     * Supervises an external application without adding output or replaying it.
+     * Null cwd, log and timeout inherit the working directory and raw standard
+     * handles without an application deadline. On JVM shutdown, a grace period
+     * lets an already-broadcast OS signal run the application's shutdown hooks
+     * before remaining children are stopped. Ordinary exit releases helpers.
+     */
+    public static Result runSupervised(List<String> command, Path cwd,
+                                       Map<String, String> environment, Path log,
+                                       Duration timeout) throws IOException, InterruptedException {
+        return execute(command, cwd, environment, log, null, timeout, true, false, true);
     }
 
     /** Linux fixture execution with an isolated process group, including orphan cleanup. */
     public static Result runIsolated(List<String> command, Path cwd,
                                      Map<String, String> environment, Path log,
                                      Duration timeout) throws IOException, InterruptedException {
-        return execute(command, cwd, environment, log, null, timeout, true, true);
+        return execute(command, cwd, environment, log, null, timeout, true, true, false);
     }
 
     /** Captures stdout and stderr separately while bounding their combined bytes. */
@@ -64,12 +78,24 @@ public final class ChildProcess {
                 || stdout.toAbsolutePath().normalize().equals(stderr.toAbsolutePath().normalize())) {
             throw new IOException("Separate child output requires two distinct log files");
         }
-        return execute(command, cwd, environment, stdout, stderr, timeout, false, false);
+        return execute(command, cwd, environment, stdout, stderr, timeout, false, false, false);
+    }
+
+    /** Separate-stream capture with the external supervisor's shutdown grace. */
+    public static Result runSupervised(List<String> command, Path cwd,
+                                       Map<String, String> environment, Path stdout, Path stderr,
+                                       Duration timeout) throws IOException, InterruptedException {
+        if (stdout == null || stderr == null
+                || stdout.toAbsolutePath().normalize().equals(stderr.toAbsolutePath().normalize())) {
+            throw new IOException("Separate child output requires two distinct log files");
+        }
+        return execute(command, cwd, environment, stdout, stderr, timeout, false, false, true);
     }
 
     private static Result execute(List<String> command, Path cwd,
                                   Map<String, String> environment, Path stdout, Path stderr,
-                                  Duration timeout, boolean merged, boolean isolated) throws IOException, InterruptedException {
+                                  Duration timeout, boolean merged, boolean isolated,
+                                  boolean supervised) throws IOException, InterruptedException {
         if (Thread.interrupted()) {
             throw new InterruptedException("Child execution interrupted");
         }
@@ -100,7 +126,7 @@ public final class ChildProcess {
             if (errors != null) builder.redirectError(errors.toFile());
         }
 
-        ProcessTree tree = new ProcessTree(groupKill);
+        ProcessTree tree = new ProcessTree(groupKill, supervised);
         Thread shutdown = new Thread(tree::stopOnShutdown, "loadonce-child-cleanup");
         try {
             Runtime.getRuntime().addShutdownHook(shutdown);
@@ -194,7 +220,7 @@ public final class ChildProcess {
             // child's environment. Resolve explicitly so probes and launches use
             // the same selected executable, including a custom clean PATH.
             argv.set(0, resolveExecutable(argv.get(0), cwd, exactEnvironment).toString());
-            ProcessBuilder builder = new ProcessBuilder(argv);
+            ProcessBuilder builder = new ProcessBuilder(WindowsCommandLine.forProcessBuilder(argv));
             builder.environment().clear();
             builder.environment().putAll(exactEnvironment);
             if (cwd != null) {
@@ -343,12 +369,14 @@ public final class ChildProcess {
         private final Map<Long, ProcessHandle> observed = new LinkedHashMap<>();
         private final Set<Long> isolatedGroups = new LinkedHashSet<>();
         private final Path groupKill;
+        private final boolean supervised;
         private Process root;
         private boolean closing;
         private boolean groupConfirmed;
 
-        private ProcessTree(Path groupKill) {
+        private ProcessTree(Path groupKill, boolean supervised) {
             this.groupKill = groupKill;
+            this.supervised = supervised;
         }
 
         synchronized Process start(ProcessBuilder builder) throws IOException {
@@ -521,6 +549,25 @@ public final class ChildProcess {
         }
 
         void stopOnShutdown() {
+            if (supervised) {
+                boolean interrupted = Thread.interrupted();
+                long started = System.nanoTime();
+                Process child;
+                synchronized (this) {
+                    closing = true;
+                    child = root;
+                }
+                while (child != null && child.isAlive()
+                        && System.nanoTime() - started < SUPERVISED_SHUTDOWN_NANOS) {
+                    sample();
+                    try {
+                        child.waitFor(POLL_MILLIS, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException cancelled) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+            }
             stopAfterFailure(this);
         }
     }

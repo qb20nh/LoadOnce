@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -20,6 +21,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
@@ -52,15 +54,21 @@ public final class RuntimeRedirectTest {
                 fixture.exactInvocation(redirector, false, 0);
                 fixture.exactInvocation(redirector, false, 7);
                 fixture.exactInvocation(redirector, true, 0);
+                fixture.binaryStreams(redirector);
                 // javaw information/usage paths can open native JDK dialogs on a headless runner.
-                if (!name.equals("javaw.exe")) fixture.probes(redirector);
+                if (!name.equals("javaw.exe")) {
+                    fixture.probes(redirector);
+                    fixture.environmentOptions(redirector);
+                }
                 fixture.configurationFailures(redirector);
                 fixture.helperSurvivesNormalExit(redirector);
-                fixture.cancellation(redirector);
+                fixture.cancellation(redirector, false, false);
+                fixture.cancellation(redirector, true, false);
+                if (!WINDOWS) fixture.cancellation(redirector, false, true);
             }
         }
         System.out.println("Native runtime redirect contracts passed: " + checks
-                + " platform=" + (WINDOWS ? "Windows-java-and-javaw" : "Linux-exec"));
+                + " platform=" + (WINDOWS ? "Windows-java-and-javaw-supervised" : "Linux-supervised"));
     }
 
     private static final class Fixture implements AutoCloseable {
@@ -69,6 +77,7 @@ public final class RuntimeRedirectTest {
         final Path javaHome;
         final Path backend;
         final Path agent;
+        final Path supervisor;
         final Path configuration;
         final Path cwd;
         final Path checkerJar;
@@ -89,10 +98,13 @@ public final class RuntimeRedirectTest {
             checkerJar = root.resolve(WINDOWS ? "checker fixture.jar" : "checker fixture π.jar");
             shutdown = new Thread(this::stopAll, "loadonce-redirect-contract-cleanup");
             try {
-                RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), output, options.agentJar());
+                RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), output, options.agentJar(), options.supervisorJar());
                 agent = output.resolve("loadonce-agent.jar").toRealPath();
                 check(Files.mismatch(options.agentJar().toRealPath(), agent) == -1,
                         "installed agent differs from the supplied JAR");
+                supervisor = output.resolve("loadonce-supervisor.jar").toRealPath();
+                check(Files.mismatch(options.supervisorJar().toRealPath(), supervisor) == -1,
+                        "installed supervisor differs from the supplied JAR");
                 configuration = output.resolve("bin/loadonce-runtime.conf");
                 check(Files.isRegularFile(configuration), "installed redirector configuration is missing");
                 environment = cleanEnvironment(root, javaHome);
@@ -146,7 +158,7 @@ public final class RuntimeRedirectTest {
             Path bin = Files.createDirectory(home.resolve("bin"));
             for (String name : List.of("java.exe", "javaw.exe")) Files.copy(witness, bin.resolve(name));
             Path selected = RuntimeRedirectInstaller.install(home, options.redirectorsDirectory(),
-                    root.resolve("native wide runtime"), options.agentJar());
+                    root.resolve("native wide runtime"), options.agentJar(), options.supervisorJar(), javaHome);
             Path working = Files.createDirectory(root.resolve("native working directory 한글 π 🧪"));
             String agentOption = "-javaagent:" + selected.resolve("loadonce-agent.jar").toRealPath();
             for (String name : List.of("java.exe", "javaw.exe")) {
@@ -198,13 +210,43 @@ public final class RuntimeRedirectTest {
 
         void rejectsAgentPath(Options options, Path rejected) throws Exception {
             try {
-                RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), rejected, options.agentJar());
+                RuntimeRedirectInstaller.install(javaHome, options.redirectorsDirectory(), rejected, options.agentJar(), options.supervisorJar());
                 throw new AssertionError("installer accepted an agent path the Windows JDK cannot preserve");
             } catch (IOException expected) {
                 check(expected.getMessage().contains("cannot be preserved by Windows native.encoding"),
                         "unsupported agent path failed for an unrelated reason");
             }
             check(!Files.exists(rejected), "installer published an unsupported agent path");
+        }
+
+        void binaryStreams(Path redirector) throws Exception {
+            Path inputRecord = root.resolve(UUID.randomUUID() + ".binary-input");
+            List<String> command = List.of(redirector.toString(), "-cp", fixtureClasspath(),
+                    Witness.class.getName(), "--binary-streams", inputRecord.toString());
+            byte[] input = Witness.binaryPayload(37);
+            Running child = start(command, input);
+            finish(child, Duration.ofSeconds(30));
+            equal(0, child.process().exitValue(), "binary stream fixture failed");
+            check(Arrays.equals(input, Files.readAllBytes(inputRecord)), "supervisor changed raw stdin bytes");
+            check(Arrays.equals(Witness.binaryPayload(0), Files.readAllBytes(child.log())), "supervisor changed raw stdout bytes");
+            check(Arrays.equals(Witness.binaryPayload(113), Files.readAllBytes(child.error())), "supervisor changed raw stderr bytes");
+        }
+
+        void environmentOptions(Path redirector) throws Exception {
+            Map<String, String> optionsEnvironment = new LinkedHashMap<>(environment);
+            optionsEnvironment.put("JAVA_TOOL_OPTIONS", "-Dloadonce.redirect.tool.option=tool-value");
+            optionsEnvironment.put("_JAVA_OPTIONS", "-Dloadonce.redirect.legacy.option=legacy-value");
+            optionsEnvironment.put("JDK_JAVA_OPTIONS", "-Dloadonce.redirect.jdk.option=jdk-value");
+            Result expected = run(List.of(backend.toString(), "-version"), Duration.ofSeconds(20),
+                    new byte[0], cwd, optionsEnvironment);
+            Result actual = run(List.of(redirector.toString(), "-version"), Duration.ofSeconds(20),
+                    new byte[0], cwd, optionsEnvironment);
+            equal(expected.exitCode(), actual.exitCode(), "JVM environment option probe exit changed");
+            equal(expected.stdout(), actual.stdout(), "JVM environment options changed probe stdout");
+            equal(expected.stderr(), actual.stderr(), "JVM environment options were applied to the controller or lost");
+            equal(1, occurrences(actual.output(), "Picked up JAVA_TOOL_OPTIONS:"), "JAVA_TOOL_OPTIONS output must appear once");
+            equal(1, occurrences(actual.output(), "Picked up _JAVA_OPTIONS:"), "_JAVA_OPTIONS output must appear once");
+            equal(1, occurrences(actual.output(), "Picked up JDK_JAVA_OPTIONS:"), "JDK_JAVA_OPTIONS output must appear once");
         }
 
         void probes(Path redirector) throws Exception {
@@ -259,19 +301,36 @@ public final class RuntimeRedirectTest {
                     && !result.output().contains("REDIRECT_WITNESS_MAIN"), scenario + " executed application main");
         }
 
-        void cancellation(Path redirector) throws Exception {
-            Invocation invocation = invocation(redirector, false, 0, 60_000);
+        void cancellation(Path redirector, boolean controller, boolean graceful) throws Exception {
+            Invocation invocation = invocation(redirector, false, 0, -2);
             Running running = start(invocation.command(), STDIN.getBytes(StandardCharsets.UTF_8));
             WitnessRecord record = awaitRecord(running.process(), invocation.record(), Duration.ofSeconds(30));
             remember(record.pid());
+            remember(record.parentPid());
+            remember(record.helperPid());
             assertIdentity(running.process().pid(), record);
-            running.process().destroyForcibly();
+            check(record.helperPid() > 0 && alive(record.helperPid()), "cancellation fixture has no live helper");
+            if (controller) {
+                ProcessHandle handle = ProcessHandle.of(record.parentPid()).orElseThrow(() -> new IOException("controller disappeared"));
+                check(handle.destroyForcibly(), "controller could not be forcibly terminated");
+            } else if (graceful) {
+                running.process().destroy();
+            } else {
+                running.process().destroyForcibly();
+            }
             check(running.process().waitFor(10, TimeUnit.SECONDS), "cancelled redirector did not exit");
             long started = System.nanoTime();
-            while (alive(record.pid()) && System.nanoTime() - started < Duration.ofSeconds(10).toNanos()) {
+            while ((running(record.pid()) || running(record.helperPid()) || running(record.parentPid()))
+                    && System.nanoTime() - started < Duration.ofSeconds(10).toNanos()) {
                 TimeUnit.MILLISECONDS.sleep(25);
             }
-            check(!alive(record.pid()), "killing the redirector left its actual JVM alive");
+            check(!running(record.pid()), "cancelling the launch left its actual JVM running");
+            check(!running(record.helperPid()), "cancelling the launch left its application helper running");
+            check(!running(record.parentPid()), "cancelling the launch left its Java controller running");
+            if (graceful) {
+                equal("APPLICATION_SHUTDOWN_HOOK", Files.readString(invocation.record().resolveSibling(
+                        invocation.record().getFileName() + ".shutdown")), "graceful cancellation skipped the application hook");
+            }
             equal(List.of(Long.toString(record.pid())), Files.readAllLines(invocation.starts()), "cancelled application replayed");
         }
 
@@ -303,7 +362,8 @@ public final class RuntimeRedirectTest {
         }
 
         void writeConfiguration(Path java, Path agentJar) throws IOException {
-            Files.writeString(configuration, "java=" + java.toAbsolutePath() + "\nagent=" + agentJar.toAbsolutePath() + "\n",
+            Files.writeString(configuration, "java=" + java.toAbsolutePath() + "\nbootstrap-java=" + backend
+                            + "\nsupervisor=" + supervisor + "\nagent=" + agentJar.toAbsolutePath() + "\n",
                     StandardCharsets.UTF_8);
         }
 
@@ -312,20 +372,32 @@ public final class RuntimeRedirectTest {
         }
 
         synchronized Running start(List<String> command, byte[] stdin, Path workingDirectory) throws IOException {
+            return start(command, stdin, workingDirectory, environment);
+        }
+
+        synchronized Running start(List<String> command, byte[] stdin, Path workingDirectory,
+                                   Map<String, String> childEnvironment) throws IOException {
             if (closed) throw new IOException("redirect fixture is closed");
             Path log = Files.createTempFile(root, "child-", ".log");
             Path error = Files.createTempFile(root, "child-stderr-", ".log");
             ProcessBuilder builder = new ProcessBuilder(WindowsCommandLine.forProcessBuilder(command)).directory(workingDirectory.toFile())
                     .redirectOutput(log.toFile()).redirectError(error.toFile());
             builder.environment().clear();
-            builder.environment().putAll(environment);
+            builder.environment().putAll(childEnvironment);
             Process process = builder.start();
             processes.add(process);
             observed.put(process.pid(), process.toHandle());
-            try (var input = process.getOutputStream()) {
-                input.write(stdin);
-            }
-            return new Running(process, log, error);
+            AtomicReference<IOException> inputFailure = new AtomicReference<>();
+            Thread inputWriter = new Thread(() -> {
+                try (var input = process.getOutputStream()) {
+                    input.write(stdin);
+                } catch (IOException failure) {
+                    if (stdin.length != 0) inputFailure.set(failure);
+                }
+            }, "loadonce-redirect-fixture-stdin");
+            inputWriter.setDaemon(true);
+            inputWriter.start();
+            return new Running(process, log, error, inputWriter, inputFailure);
         }
 
         Result run(List<String> command, Duration timeout) throws Exception {
@@ -337,7 +409,19 @@ public final class RuntimeRedirectTest {
         }
 
         Result run(List<String> command, Duration timeout, byte[] stdin, Path workingDirectory) throws Exception {
-            Running running = start(command, stdin, workingDirectory);
+            return run(command, timeout, stdin, workingDirectory, environment);
+        }
+
+        Result run(List<String> command, Duration timeout, byte[] stdin, Path workingDirectory,
+                   Map<String, String> childEnvironment) throws Exception {
+            Running running = start(command, stdin, workingDirectory, childEnvironment);
+            finish(running, timeout);
+            return new Result(running.process().pid(), running.process().exitValue(),
+                    new String(Files.readAllBytes(running.log()), StandardCharsets.UTF_8),
+                    new String(Files.readAllBytes(running.error()), StandardCharsets.UTF_8));
+        }
+
+        void finish(Running running, Duration timeout) throws Exception {
             long started = System.nanoTime();
             while (running.process().isAlive()) {
                 sample();
@@ -347,11 +431,15 @@ public final class RuntimeRedirectTest {
                 }
                 running.process().waitFor(25, TimeUnit.MILLISECONDS);
             }
-            int exit = running.process().waitFor();
+            running.process().waitFor();
+            running.inputWriter().join(1000);
+            check(!running.inputWriter().isAlive(), "fixture stdin writer did not finish after child exit");
             check(Files.size(running.log()) + Files.size(running.error()) <= 4 * 1024 * 1024, "redirector exceeded its output limit");
-            return new Result(running.process().pid(), exit,
-                    new String(Files.readAllBytes(running.log()), StandardCharsets.UTF_8),
-                    new String(Files.readAllBytes(running.error()), StandardCharsets.UTF_8));
+            if (running.inputFailure().get() != null) {
+                throw new IOException("fixture stdin was not consumed; child exit=" + running.process().exitValue()
+                        + "; stdout=" + diagnostic(running.log()) + "; stderr=" + diagnostic(running.error()),
+                        running.inputFailure().get());
+            }
         }
 
         WitnessRecord awaitRecord(Process process, Path record, Duration timeout) throws Exception {
@@ -412,18 +500,18 @@ public final class RuntimeRedirectTest {
     }
 
     private static void assertIdentity(long redirectorPid, WitnessRecord record) {
-        if (WINDOWS) {
-            check(redirectorPid != record.pid(), "Windows wrapper must supervise a distinct JVM process");
-            equal(redirectorPid, record.parentPid(), "actual JVM is not the native redirector's child");
-        } else {
-            equal(redirectorPid, record.pid(), "Linux redirector did not exec the actual JVM in place");
-        }
+        check(redirectorPid != record.pid() && redirectorPid != record.parentPid()
+                && record.pid() != record.parentPid(), "frontend, Java controller and actual JVM must have distinct identities");
+        equal(redirectorPid, WINDOWS ? record.grandparentPid() : record.greatGrandparentPid(),
+                "actual JVM ancestry does not reach the native redirector through its controller");
+        if (!WINDOWS) check(record.grandparentPid() != redirectorPid && record.grandparentPid() != record.parentPid(),
+                "Linux native guardian is missing from application ancestry");
     }
 
     private static WitnessRecord readRecord(Path path) throws IOException {
         try (DataInputStream input = new DataInputStream(Files.newInputStream(path))) {
-            if (!input.readUTF().equals("runtime-redirect-witness-1")) throw new IOException("invalid witness record");
-            WitnessRecord result = new WitnessRecord(input.readLong(), input.readLong(), input.readLong(), input.readUTF(), input.readUTF(),
+            if (!input.readUTF().equals("runtime-redirect-witness-2")) throw new IOException("invalid witness record");
+            WitnessRecord result = new WitnessRecord(input.readLong(), input.readLong(), input.readLong(), input.readLong(), input.readLong(), input.readUTF(), input.readUTF(),
                     input.readUTF(), input.readUTF(), input.readUTF(), input.readUTF(), input.readUTF(), readList(input), readList(input));
             if (input.read() != -1) throw new IOException("unexpected trailing witness bytes");
             return result;
@@ -508,6 +596,24 @@ public final class RuntimeRedirectTest {
         return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
     }
 
+    private static String diagnostic(Path path) throws IOException {
+        try (InputStream input = Files.newInputStream(path)) {
+            return new String(input.readNBytes(4096), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static boolean running(long pid) throws IOException {
+        if (!alive(pid)) return false;
+        if (WINDOWS) return true;
+        Path stat = Path.of("/proc", Long.toString(pid), "stat");
+        try {
+            String status = Files.readString(stat);
+            return status.charAt(status.lastIndexOf(')') + 2) != 'Z';
+        } catch (java.nio.file.NoSuchFileException gone) {
+            return false;
+        }
+    }
+
     private static int occurrences(String text, String expected) {
         int count = 0;
         for (int index = text.indexOf(expected); index >= 0; index = text.indexOf(expected, index + expected.length())) count++;
@@ -531,36 +637,52 @@ public final class RuntimeRedirectTest {
     }
 
     private record Invocation(List<String> command, Path record, Path starts) { }
-    private record Running(Process process, Path log, Path error) { }
+    private record Running(Process process, Path log, Path error, Thread inputWriter,
+                           AtomicReference<IOException> inputFailure) { }
     private record Result(long pid, int exitCode, String stdout, String stderr) {
         String output() { return stdout + stderr; }
     }
-    private record WitnessRecord(long pid, long parentPid, long helperPid, String javaHome, String cwd, String marker,
+    private record WitnessRecord(long pid, long parentPid, long grandparentPid, long greatGrandparentPid, long helperPid,
+                                 String javaHome, String cwd, String marker,
                                  String vmProperty, String agentStatus, String agentSource, String stdin,
                                  List<String> arguments, List<String> agents) { }
 
-    private record Options(Path agentJar, Path redirectorsDirectory, Path javaHome) {
+    private record Options(Path agentJar, Path supervisorJar, Path redirectorsDirectory, Path javaHome) {
         static Options parse(String[] arguments) throws IOException {
             Map<String, Path> values = new LinkedHashMap<>();
             for (int index = 0; index < arguments.length; index += 2) {
                 String key = arguments[index];
-                if (!List.of("--agent-jar", "--redirectors-dir", "--java-home").contains(key)
+                if (!List.of("--agent-jar", "--supervisor-jar", "--redirectors-dir", "--java-home").contains(key)
                         || index + 1 >= arguments.length || values.containsKey(key)) {
-                    throw new IOException("Usage: RuntimeRedirectTest --agent-jar PATH --redirectors-dir PATH [--java-home PATH]");
+                    throw new IOException("Usage: RuntimeRedirectTest --agent-jar PATH --supervisor-jar PATH --redirectors-dir PATH [--java-home PATH]");
                 }
                 values.put(key, Path.of(arguments[index + 1]).toAbsolutePath().normalize());
             }
-            if (!values.containsKey("--agent-jar") || !values.containsKey("--redirectors-dir")) {
-                throw new IOException("--agent-jar and --redirectors-dir are required");
+            if (!values.containsKey("--agent-jar") || !values.containsKey("--supervisor-jar") || !values.containsKey("--redirectors-dir")) {
+                throw new IOException("--agent-jar, --supervisor-jar and --redirectors-dir are required");
             }
-            return new Options(values.get("--agent-jar"), values.get("--redirectors-dir"),
+            return new Options(values.get("--agent-jar"), values.get("--supervisor-jar"), values.get("--redirectors-dir"),
                     values.getOrDefault("--java-home", Path.of(System.getProperty("java.home"))));
         }
     }
 
     /** Self-contained checker JAR entrypoint; records the actual VM before exiting or sleeping. */
     public static final class Witness {
+        static byte[] binaryPayload(int offset) {
+            byte[] result = new byte[256 * 1024 + 31];
+            for (int index = 0; index < result.length; index++) result[index] = (byte) (index + offset);
+            return result;
+        }
+
         public static void main(String[] arguments) throws Exception {
+            if (arguments[0].equals("--binary-streams")) {
+                System.out.write(binaryPayload(0));
+                System.out.flush();
+                System.err.write(binaryPayload(113));
+                System.err.flush();
+                Files.write(Path.of(arguments[1]), System.in.readAllBytes());
+                return;
+            }
             if (arguments[0].equals("--helper")) {
                 Files.writeString(Path.of(arguments[1]), Long.toString(ProcessHandle.current().pid()));
                 TimeUnit.SECONDS.sleep(60);
@@ -579,7 +701,7 @@ public final class RuntimeRedirectTest {
                     .filter(value -> value.startsWith("-javaagent:")).toList();
             long helperPid = 0;
             long sleepMillis = Long.parseLong(arguments[3]);
-            if (sleepMillis == -1) {
+            if (sleepMillis == -1 || sleepMillis == -2) {
                 Path helperRecord = record.resolveSibling(record.getFileName() + ".helper");
                 String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
                 Process helper = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", executable).toString(),
@@ -596,11 +718,28 @@ public final class RuntimeRedirectTest {
                 }
                 helperPid = helper.pid();
             }
+            if (sleepMillis == -2) {
+                Path shutdownRecord = record.resolveSibling(record.getFileName() + ".shutdown");
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    try {
+                        TimeUnit.MILLISECONDS.sleep(150);
+                        Files.writeString(shutdownRecord, "APPLICATION_SHUTDOWN_HOOK", StandardCharsets.UTF_8);
+                    } catch (IOException failure) {
+                        throw new java.io.UncheckedIOException(failure);
+                    } catch (InterruptedException cancelled) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, "loadonce-redirect-fixture-shutdown"));
+            }
             Path staged = record.resolveSibling(record.getFileName() + ".tmp");
             try (DataOutputStream output = new DataOutputStream(Files.newOutputStream(staged))) {
-                output.writeUTF("runtime-redirect-witness-1");
+                output.writeUTF("runtime-redirect-witness-2");
                 output.writeLong(pid);
-                output.writeLong(ProcessHandle.current().parent().map(ProcessHandle::pid).orElse(-1L));
+                var parent = ProcessHandle.current().parent();
+                var grandparent = parent.flatMap(ProcessHandle::parent);
+                output.writeLong(parent.map(ProcessHandle::pid).orElse(-1L));
+                output.writeLong(grandparent.map(ProcessHandle::pid).orElse(-1L));
+                output.writeLong(grandparent.flatMap(ProcessHandle::parent).map(ProcessHandle::pid).orElse(-1L));
                 output.writeLong(helperPid);
                 output.writeUTF(System.getProperty("java.home"));
                 output.writeUTF(Path.of("").toAbsolutePath().normalize().toString());
@@ -617,6 +756,7 @@ public final class RuntimeRedirectTest {
             Files.move(staged, record);
             System.out.println("REDIRECT_WITNESS_MAIN");
             System.err.println("REDIRECT_WITNESS_STDERR");
+            if (sleepMillis == -2) TimeUnit.SECONDS.sleep(60);
             if (sleepMillis > 0) TimeUnit.MILLISECONDS.sleep(sleepMillis);
             System.exit(Integer.parseInt(arguments[2]));
         }

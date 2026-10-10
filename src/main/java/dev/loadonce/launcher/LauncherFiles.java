@@ -1,6 +1,5 @@
 package dev.loadonce.launcher;
 
-import com.sun.security.auth.module.UnixSystem;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -54,8 +53,12 @@ public final class LauncherFiles {
 
     public static String ownerId() throws IOException {
         try {
-            return Long.toString(new UnixSystem().getUid());
-        } catch (LinkageError | SecurityException failure) {
+            Class<?> system = Class.forName("com.sun.security.auth.module.UnixSystem");
+            Object instance = system.getConstructor().newInstance();
+            Object uid = system.getMethod("getUid").invoke(instance);
+            if (!(uid instanceof Long value) || value < 0) throw new IOException("POSIX ownership is unavailable");
+            return Long.toString(value);
+        } catch (ReflectiveOperationException | LinkageError | SecurityException failure) {
             throw new IOException("POSIX ownership is unavailable");
         }
     }

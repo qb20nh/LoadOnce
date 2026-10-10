@@ -23,10 +23,14 @@
 
 #define CONFIG_NAME "loadonce-runtime.conf"
 #define CONFIG_LIMIT (1024U * 1024U)
+#define PAYLOAD_LIMIT (8U * 1024U * 1024U)
+#define ENTRY_LIMIT 65536U
 
 struct configuration {
     char *storage;
     char *java;
+    char *bootstrap_java;
+    char *supervisor;
     char *agent;
 };
 
@@ -72,7 +76,7 @@ static int valid_value(const char *value) {
 }
 
 static struct configuration read_configuration(FILE *file) {
-    struct configuration result = {NULL, NULL, NULL};
+    struct configuration result = {NULL, NULL, NULL, NULL, NULL};
     long file_size;
     size_t length;
     char *cursor;
@@ -99,14 +103,65 @@ static struct configuration read_configuration(FILE *file) {
         line_length = strlen(line);
         if (line_length != 0 && line[line_length - 1] == '\r') line[line_length - 1] = 0;
         if (strncmp(line, "java=", 5) == 0) { destination = &result.java; line += 5; }
+        else if (strncmp(line, "bootstrap-java=", 15) == 0) { destination = &result.bootstrap_java; line += 15; }
+        else if (strncmp(line, "supervisor=", 11) == 0) { destination = &result.supervisor; line += 11; }
         else if (strncmp(line, "agent=", 6) == 0) { destination = &result.agent; line += 6; }
         else fail("configuration contains an unknown or malformed field");
         if (*destination != NULL || !valid_value(line)) fail("configuration contains a duplicate or empty field");
         *destination = line;
     }
-    if (result.java == NULL || result.agent == NULL) fail("configuration requires java and agent fields");
+    if (result.java == NULL || result.bootstrap_java == NULL || result.supervisor == NULL || result.agent == NULL)
+        fail("configuration requires java, bootstrap-java, supervisor and agent fields");
     if (strchr(result.agent, '=') != NULL) fail("agent path cannot contain the Java agent option separator");
     return result;
+}
+
+struct payload {
+    unsigned char *bytes;
+    size_t length;
+    size_t capacity;
+};
+
+static void payload_append(struct payload *payload, const void *bytes, size_t length) {
+    size_t required;
+    if (length > PAYLOAD_LIMIT - payload->length) fail("supervisor input exceeds the protocol limit");
+    required = payload->length + length;
+    if (required > payload->capacity) {
+        size_t capacity = payload->capacity == 0 ? 4096 : payload->capacity;
+        unsigned char *replacement;
+        while (capacity < required) capacity *= 2;
+        replacement = realloc(payload->bytes, capacity);
+        if (replacement == NULL) fail("allocation failed");
+        payload->bytes = replacement;
+        payload->capacity = capacity;
+    }
+    memcpy(payload->bytes + payload->length, bytes, length);
+    payload->length = required;
+}
+
+static void payload_number(struct payload *payload, uint32_t value) {
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char) (value >> 24);
+    bytes[1] = (unsigned char) (value >> 16);
+    bytes[2] = (unsigned char) (value >> 8);
+    bytes[3] = (unsigned char) value;
+    payload_append(payload, bytes, sizeof(bytes));
+}
+
+static void payload_string_length(struct payload *payload, const char *value, size_t length) {
+    if (length > PAYLOAD_LIMIT || !valid_utf8((const unsigned char *) value, length))
+        fail("supervisor input must be bounded UTF-8");
+    payload_number(payload, (uint32_t) length);
+    payload_append(payload, value, length);
+}
+
+static void payload_string(struct payload *payload, const char *value) {
+    payload_string_length(payload, value, strlen(value));
+}
+
+static uint32_t completion_number(const unsigned char *bytes) {
+    return ((uint32_t) bytes[0] << 24) | ((uint32_t) bytes[1] << 16)
+            | ((uint32_t) bytes[2] << 8) | bytes[3];
 }
 
 #ifndef _WIN32
@@ -135,42 +190,71 @@ static char *adjacent_path(const char *executable, const char *name) {
     return path;
 }
 
-int main(int argc, char **argv) {
-    char *self = executable_path();
-    char *config_path = adjacent_path(self, CONFIG_NAME);
-    struct configuration config = read_configuration(fopen(config_path, "rb"));
+static void validate_linux_backend(const char *self, const char *backend) {
     struct stat self_info;
     struct stat backend_info;
-    struct stat agent_info;
     char *backend_config;
     char *canonical_backend;
-    char *agent_option;
-    char **arguments;
-    size_t index;
-    if (config.java[0] != '/' || config.agent[0] != '/') fail("configured paths must be absolute");
-    if (stat(self, &self_info) != 0 || stat(config.java, &backend_info) != 0
-            || !S_ISREG(backend_info.st_mode) || access(config.java, X_OK) != 0)
+    if (backend[0] != '/') fail("configured paths must be absolute");
+    if (stat(self, &self_info) != 0 || stat(backend, &backend_info) != 0
+            || !S_ISREG(backend_info.st_mode) || access(backend, X_OK) != 0)
         fail("configured backend is not an executable regular file");
     if (self_info.st_dev == backend_info.st_dev && self_info.st_ino == backend_info.st_ino)
         fail("configured backend redirects to this executable");
-    canonical_backend = realpath(config.java, NULL);
+    canonical_backend = realpath(backend, NULL);
     if (canonical_backend == NULL) fail("cannot resolve configured backend");
     backend_config = adjacent_path(canonical_backend, CONFIG_NAME);
     if (access(backend_config, F_OK) == 0) fail("configured backend is another LoadOnce redirect runtime");
-    if (stat(config.agent, &agent_info) != 0 || !S_ISREG(agent_info.st_mode) || access(config.agent, R_OK) != 0)
-        fail("configured agent is not a readable regular file");
-    agent_option = allocate(strlen(config.agent) + sizeof("-javaagent:"));
-    strcpy(agent_option, "-javaagent:");
-    strcat(agent_option, config.agent);
-    arguments = allocate(((size_t) argc + 2) * sizeof(*arguments));
-    arguments[0] = config.java;
-    arguments[1] = agent_option;
-    for (index = 1; index < (size_t) argc; index++) arguments[index + 1] = argv[index];
-    arguments[(size_t) argc + 1] = NULL;
-    /* exec preserves process identity, signals, cwd, environment and inherited descriptors. */
-    execv(config.java, arguments);
-    fail("could not execute configured Java backend");
-    return 1;
+    free(backend_config);
+    free(canonical_backend);
+}
+
+static void validate_linux_artifact(const char *path) {
+    struct stat info;
+    if (path[0] != '/') fail("configured paths must be absolute");
+    if (stat(path, &info) != 0 || !S_ISREG(info.st_mode) || access(path, R_OK) != 0)
+        fail("configured artifact is not a readable regular file");
+}
+
+#include "linux_supervisor.h"
+
+int main(int argc, char **argv) {
+    extern char **environ;
+    char *self = executable_path();
+    char *config_path = adjacent_path(self, CONFIG_NAME);
+    char *policy = adjacent_path(self, "../loadonce-policy.conf");
+    struct configuration config = read_configuration(fopen(config_path, "rb"));
+    struct payload payload = {NULL, 0, 0};
+    size_t count = 0;
+    size_t index;
+    int result;
+    validate_linux_backend(self, config.java);
+    validate_linux_backend(self, config.bootstrap_java);
+    validate_linux_artifact(config.agent);
+    validate_linux_artifact(config.supervisor);
+    if (argc < 1 || (unsigned int) (argc - 1) > ENTRY_LIMIT) fail("too many Java arguments");
+    payload_number(&payload, UINT32_C(0x4c4f5331));
+    payload_string(&payload, config.java);
+    payload_string(&payload, config.agent);
+    payload_number(&payload, (uint32_t) (argc - 1));
+    for (index = 1; index < (size_t) argc; index++) payload_string(&payload, argv[index]);
+    while (environ[count] != NULL) {
+        if (++count > ENTRY_LIMIT) fail("too many environment entries");
+    }
+    payload_number(&payload, (uint32_t) count);
+    for (index = 0; index < count; index++) {
+        const char *separator = strchr(environ[index], '=');
+        if (separator == NULL || separator == environ[index]) fail("malformed environment entry");
+        payload_string_length(&payload, environ[index], (size_t) (separator - environ[index]));
+        payload_string(&payload, separator + 1);
+    }
+    result = supervise_linux(&config, policy, payload.bytes, payload.length);
+    free(payload.bytes);
+    free(config.storage);
+    free(self);
+    free(config_path);
+    free(policy);
+    return result;
 }
 #else
 static wchar_t *executable_path(void) {
@@ -245,20 +329,15 @@ static wchar_t *canonical_path(const wchar_t *path) {
     return result;
 }
 
-static wchar_t *command_line(int argc, wchar_t **argv, const wchar_t *java, const wchar_t *agent) {
-    size_t capacity = 2 * (wcslen(java) + wcslen(agent)) + 32;
+static wchar_t *command_line(size_t count, const wchar_t *const *arguments) {
+    size_t capacity = 1;
     size_t cursor = 0;
     wchar_t *result;
-    wchar_t *agent_option;
-    int index;
-    for (index = 1; index < argc; index++) capacity += 2 * wcslen(argv[index]) + 4;
+    size_t index;
+    for (index = 0; index < count; index++) capacity += 2 * wcslen(arguments[index]) + 4;
     result = allocate(capacity * sizeof(*result));
-    agent_option = allocate((wcslen(agent) + 12) * sizeof(*agent_option));
-    wcscpy(agent_option, L"-javaagent:");
-    wcscat(agent_option, agent);
-    for (index = 0; index <= argc; index++) {
-        const wchar_t *argument = index == 0 ? java : index == 1 ? agent_option : argv[index - 1];
-        const wchar_t *scan = argument;
+    for (index = 0; index < count; index++) {
+        const wchar_t *scan = arguments[index];
         if (index != 0) result[cursor++] = L' ';
         result[cursor++] = L'"';
         while (*scan != 0) {
@@ -273,20 +352,24 @@ static wchar_t *command_line(int argc, wchar_t **argv, const wchar_t *java, cons
     }
     if (cursor >= 32767U) fail("redirected command line exceeds the Windows limit");
     result[cursor] = 0;
-    free(agent_option);
     return result;
 }
 
 static PVOID volatile control_process = NULL;
+static HANDLE cancellation_event = NULL;
+static LONG volatile cancellation_requested = 0;
 
 static BOOL WINAPI console_event(DWORD event) {
     /* The child inherits the console group, so Windows delivers each event directly.
        Replaying it with GenerateConsoleCtrlEvent would deliver Ctrl-C/Break twice. */
-    if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT) return TRUE;
-    if (event == CTRL_CLOSE_EVENT || event == CTRL_LOGOFF_EVENT || event == CTRL_SHUTDOWN_EVENT) {
+    if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT || event == CTRL_CLOSE_EVENT
+            || event == CTRL_LOGOFF_EVENT || event == CTRL_SHUTDOWN_EVENT) {
         HANDLE process = (HANDLE) InterlockedCompareExchangePointer(&control_process, NULL, NULL);
+        (void) InterlockedExchange(&cancellation_requested, 1);
+        if (cancellation_event != NULL) (void) SetEvent(cancellation_event);
         // Windows bounds console-close handlers. Let the JVM's direct event run its shutdown hooks first.
-        if (process != NULL) (void) WaitForSingleObject(process, 4000);
+        if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT && process != NULL)
+            (void) WaitForSingleObject(process, 4000);
         return TRUE;
     }
     return FALSE;
@@ -301,40 +384,219 @@ static HANDLE inherited_standard_handle(DWORD name) {
     return duplicate;
 }
 
+static void payload_wide_length(struct payload *payload, const wchar_t *value, size_t length) {
+    int bytes;
+    char *encoded;
+    if (length > INT_MAX) fail("supervisor input string is too long");
+    if (length == 0) { payload_string(payload, ""); return; }
+    bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, (int) length, NULL, 0, NULL, NULL);
+    if (bytes <= 0) fail("supervisor input contains invalid Unicode");
+    encoded = allocate((size_t) bytes);
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, (int) length,
+            encoded, bytes, NULL, NULL) != bytes) fail("supervisor input conversion failed");
+    payload_string_length(payload, encoded, (size_t) bytes);
+    free(encoded);
+}
+
+static void payload_wide(struct payload *payload, const wchar_t *value) {
+    payload_wide_length(payload, value, wcslen(value));
+}
+
+static const wchar_t *environment_separator(const wchar_t *entry) {
+    const wchar_t *separator = wcschr(entry + (*entry == L'=' ? 1 : 0), L'=');
+    if (separator == NULL || separator == entry) fail("malformed environment entry");
+    return separator;
+}
+
+static int bootstrap_environment_key(const wchar_t *entry) {
+    static const wchar_t *const removed[] = {
+        L"JAVA_TOOL_OPTIONS", L"JDK_JAVA_OPTIONS", L"_JAVA_OPTIONS", L"JDK_AOT_VM_OPTIONS",
+        L"LD_LIBRARY_PATH", L"LD_PRELOAD", L"DYLD_LIBRARY_PATH", L"DYLD_INSERT_LIBRARIES"
+    };
+    const wchar_t *separator = environment_separator(entry);
+    size_t length = (size_t) (separator - entry);
+    size_t index;
+    for (index = 0; index < sizeof(removed) / sizeof(removed[0]); index++) {
+        if (wcslen(removed[index]) == length && _wcsnicmp(entry, removed[index], length) == 0) return 0;
+    }
+    return 1;
+}
+
+static wchar_t *bootstrap_environment(const wchar_t *environment) {
+    const wchar_t *entry;
+    size_t length = 1;
+    size_t cursor = 0;
+    wchar_t *filtered;
+    for (entry = environment; *entry != 0; entry += wcslen(entry) + 1) {
+        if (bootstrap_environment_key(entry)) length += wcslen(entry) + 1;
+    }
+    if (length == 1) length = 2;
+    filtered = allocate(length * sizeof(*filtered));
+    for (entry = environment; *entry != 0; entry += wcslen(entry) + 1) {
+        if (bootstrap_environment_key(entry)) {
+            size_t count = wcslen(entry) + 1;
+            memcpy(filtered + cursor, entry, count * sizeof(*filtered));
+            cursor += count;
+        }
+    }
+    filtered[cursor++] = 0;
+    if (cursor == 1) filtered[cursor] = 0;
+    return filtered;
+}
+
+static void validate_windows_backend(const wchar_t *self, const wchar_t *java) {
+    wchar_t *canonical_backend;
+    wchar_t *backend_config;
+    if (same_file(file_identity(self), file_identity(java))) fail("configured backend redirects to this executable");
+    canonical_backend = canonical_path(java);
+    backend_config = adjacent_path(canonical_backend, L"loadonce-runtime.conf");
+    if (GetFileAttributesW(backend_config) != INVALID_FILE_ATTRIBUTES)
+        fail("configured backend is another LoadOnce redirect runtime");
+    free(backend_config);
+    free(canonical_backend);
+}
+
+struct payload_writer {
+    HANDLE pipe;
+    const unsigned char *bytes;
+    size_t length;
+    LONG volatile failed;
+};
+
+static DWORD WINAPI write_payload(LPVOID argument) {
+    struct payload_writer *writer = argument;
+    size_t cursor = 0;
+    while (cursor < writer->length) {
+        size_t remaining = writer->length - cursor;
+        DWORD count = (DWORD) (remaining > 65536U ? 65536U : remaining);
+        DWORD written = 0;
+        if (!WriteFile(writer->pipe, writer->bytes + cursor, count, &written, NULL) || written == 0) {
+            (void) InterlockedExchange(&writer->failed, 1);
+            break;
+        }
+        cursor += written;
+    }
+    CloseHandle(writer->pipe);
+    return 0;
+}
+
+static int read_completion(HANDLE pipe, DWORD exit_code) {
+    unsigned char bytes[8];
+    DWORD available = 0;
+    DWORD read_count = 0;
+    if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL) || available != sizeof(bytes)) return 0;
+    if (!ReadFile(pipe, bytes, (DWORD) sizeof(bytes), &read_count, NULL) || read_count != sizeof(bytes)) return 0;
+    return completion_number(bytes) == UINT32_C(0x4c4f4431) && completion_number(bytes + 4) == exit_code;
+}
+
 static int redirect_windows(void) {
     wchar_t *self = executable_path();
     wchar_t *config_path = adjacent_path(self, L"loadonce-runtime.conf");
     struct configuration config = read_configuration(_wfopen(config_path, L"rb"));
     wchar_t *java = utf8_path(config.java);
+    wchar_t *bootstrap_java = utf8_path(config.bootstrap_java);
+    wchar_t *supervisor = utf8_path(config.supervisor);
     wchar_t *agent = utf8_path(config.agent);
-    wchar_t *backend_config;
-    wchar_t *canonical_backend;
+    wchar_t *policy = adjacent_path(self, L"../loadonce-policy.conf");
     wchar_t **argv;
     wchar_t *line;
+    wchar_t *agent_option;
+    wchar_t *original_environment;
+    wchar_t *filtered_environment;
+    wchar_t input_descriptor[32];
+    wchar_t completion_descriptor[32];
+    const wchar_t *bootstrap_arguments[16];
+    const wchar_t *entry;
+    struct payload payload = {NULL, 0, 0};
+    struct payload_writer writer;
+    SECURITY_ATTRIBUTES pipe_security;
+    HANDLE input_read;
+    HANDLE input_write;
+    HANDLE completion_read;
+    HANDLE completion_write;
+    HANDLE writer_thread;
+    HANDLE inherited_handles[5];
+    HANDLE wait_handles[3];
+    size_t inherited_count = 0;
+    uint32_t environment_count = 0;
+    int index;
     int argc;
     HANDLE job;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     STARTUPINFOEXW startup;
     SIZE_T attribute_size = 0;
     PROCESS_INFORMATION process;
-    DWORD exit_code;
+    DWORD exit_code = 125;
+    DWORD waited;
+    int acknowledged;
     BOOL created;
 #ifdef LOADONCE_GUI
     {
         wchar_t *console_java = java;
         java = adjacent_path(console_java, L"javaw.exe");
         free(console_java);
+        console_java = bootstrap_java;
+        bootstrap_java = adjacent_path(console_java, L"javaw.exe");
+        free(console_java);
     }
 #endif
-    if (same_file(file_identity(self), file_identity(java))) fail("configured backend redirects to this executable");
+    validate_windows_backend(self, java);
+    validate_windows_backend(self, bootstrap_java);
     (void) file_identity(agent);
-    canonical_backend = canonical_path(java);
-    backend_config = adjacent_path(canonical_backend, L"loadonce-runtime.conf");
-    if (GetFileAttributesW(backend_config) != INVALID_FILE_ATTRIBUTES)
-        fail("configured backend is another LoadOnce redirect runtime");
+    (void) file_identity(supervisor);
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv == NULL || argc < 1) fail("cannot parse Unicode command line");
-    line = command_line(argc, argv, java, agent);
+    if (argv == NULL || argc < 1 || (unsigned int) (argc - 1) > ENTRY_LIMIT)
+        fail("cannot parse bounded Unicode command line");
+    original_environment = GetEnvironmentStringsW();
+    if (original_environment == NULL) fail("cannot snapshot application environment");
+    payload_number(&payload, UINT32_C(0x4c4f5331));
+    payload_wide(&payload, java);
+    payload_wide(&payload, agent);
+    payload_number(&payload, (uint32_t) (argc - 1));
+    for (index = 1; index < argc; index++) payload_wide(&payload, argv[index]);
+    for (entry = original_environment; *entry != 0; entry += wcslen(entry) + 1) {
+        if (++environment_count > ENTRY_LIMIT) fail("too many environment entries");
+    }
+    payload_number(&payload, environment_count);
+    for (entry = original_environment; *entry != 0; entry += wcslen(entry) + 1) {
+        const wchar_t *separator = environment_separator(entry);
+        payload_wide_length(&payload, entry, (size_t) (separator - entry));
+        payload_wide(&payload, separator + 1);
+    }
+    filtered_environment = bootstrap_environment(original_environment);
+    FreeEnvironmentStringsW(original_environment);
+    memset(&pipe_security, 0, sizeof(pipe_security));
+    pipe_security.nLength = (DWORD) sizeof(pipe_security);
+    pipe_security.bInheritHandle = TRUE;
+    if (!CreatePipe(&input_read, &input_write, &pipe_security, 0)
+            || !CreatePipe(&completion_read, &completion_write, &pipe_security, 0)
+            || !SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0)
+            || !SetHandleInformation(completion_read, HANDLE_FLAG_INHERIT, 0))
+        fail("cannot create supervisor transport");
+    if (swprintf(input_descriptor, sizeof(input_descriptor) / sizeof(input_descriptor[0]), L"%llu",
+            (unsigned long long) (uintptr_t) input_read) < 0
+            || swprintf(completion_descriptor, sizeof(completion_descriptor) / sizeof(completion_descriptor[0]), L"%llu",
+                    (unsigned long long) (uintptr_t) completion_write) < 0) fail("cannot format supervisor descriptors");
+    agent_option = allocate((wcslen(agent) + 12) * sizeof(*agent_option));
+    wcscpy(agent_option, L"-javaagent:");
+    wcscat(agent_option, agent);
+    bootstrap_arguments[0] = bootstrap_java;
+    bootstrap_arguments[1] = L"-Xms16m";
+    bootstrap_arguments[2] = L"-Xmx128m";
+    bootstrap_arguments[3] = L"-Djdk.lang.Process.allowAmbiguousCommands=true";
+    bootstrap_arguments[4] = L"--add-opens=java.base/java.io=ALL-UNNAMED";
+    bootstrap_arguments[5] = L"--disable-@files";
+    bootstrap_arguments[6] = agent_option;
+    bootstrap_arguments[7] = L"-cp";
+    bootstrap_arguments[8] = supervisor;
+    bootstrap_arguments[9] = L"dev.loadonce.supervisor.SupervisorMain";
+    bootstrap_arguments[10] = L"--input-descriptor";
+    bootstrap_arguments[11] = input_descriptor;
+    bootstrap_arguments[12] = L"--completion-descriptor";
+    bootstrap_arguments[13] = completion_descriptor;
+    bootstrap_arguments[14] = L"--policy";
+    bootstrap_arguments[15] = policy;
+    line = command_line(sizeof(bootstrap_arguments) / sizeof(bootstrap_arguments[0]), bootstrap_arguments);
     job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) fail("cannot create child cleanup job");
     memset(&limits, 0, sizeof(limits));
@@ -347,40 +609,87 @@ static int redirect_windows(void) {
     startup.StartupInfo.hStdInput = inherited_standard_handle(STD_INPUT_HANDLE);
     startup.StartupInfo.hStdOutput = inherited_standard_handle(STD_OUTPUT_HANDLE);
     startup.StartupInfo.hStdError = inherited_standard_handle(STD_ERROR_HANDLE);
-    if (InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_size)
+    if (startup.StartupInfo.hStdInput != NULL) inherited_handles[inherited_count++] = startup.StartupInfo.hStdInput;
+    if (startup.StartupInfo.hStdOutput != NULL) inherited_handles[inherited_count++] = startup.StartupInfo.hStdOutput;
+    if (startup.StartupInfo.hStdError != NULL) inherited_handles[inherited_count++] = startup.StartupInfo.hStdError;
+    inherited_handles[inherited_count++] = input_read;
+    inherited_handles[inherited_count++] = completion_write;
+    if (InitializeProcThreadAttributeList(NULL, 2, 0, &attribute_size)
             || GetLastError() != ERROR_INSUFFICIENT_BUFFER) fail("cannot size Java startup attributes");
     startup.lpAttributeList = allocate(attribute_size);
-    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attribute_size)
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 2, 0, &attribute_size)
             || !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                    &job, sizeof(job), NULL, NULL)) fail("cannot configure atomic child cleanup job");
+                    &job, sizeof(job), NULL, NULL)
+            || !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherited_handles, inherited_count * sizeof(inherited_handles[0]), NULL, NULL))
+        fail("cannot configure atomic supervisor ownership");
     memset(&process, 0, sizeof(process));
+    cancellation_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (cancellation_event == NULL) fail("cannot create cancellation event");
     if (!SetConsoleCtrlHandler(console_event, TRUE) && GetLastError() != ERROR_INVALID_HANDLE)
         fail("cannot register console event propagation");
     // Windows 10+ assigns the job inside process creation, including a wrapper death before ResumeThread.
-    created = CreateProcessW(java, line, NULL, NULL, TRUE, CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-            NULL, NULL, &startup.StartupInfo, &process);
+    created = CreateProcessW(bootstrap_java, line, NULL, NULL, TRUE,
+            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            filtered_environment, NULL, &startup.StartupInfo, &process);
     DeleteProcThreadAttributeList(startup.lpAttributeList);
     free(startup.lpAttributeList);
     if (startup.StartupInfo.hStdInput != NULL) CloseHandle(startup.StartupInfo.hStdInput);
     if (startup.StartupInfo.hStdOutput != NULL) CloseHandle(startup.StartupInfo.hStdOutput);
     if (startup.StartupInfo.hStdError != NULL) CloseHandle(startup.StartupInfo.hStdError);
-    if (!created) fail("could not execute configured Java backend");
+    CloseHandle(input_read);
+    CloseHandle(completion_write);
+    if (!created) fail("could not execute configured supervisor JVM");
     (void) InterlockedExchangePointer(&control_process, process.hProcess);
-    if (ResumeThread(process.hThread) == (DWORD) -1) { CloseHandle(job); fail("cannot resume Java backend"); }
+    if (ResumeThread(process.hThread) == (DWORD) -1) { CloseHandle(job); fail("cannot resume supervisor JVM"); }
     CloseHandle(process.hThread);
-    if (WaitForSingleObject(process.hProcess, INFINITE) != WAIT_OBJECT_0
+    writer.pipe = input_write;
+    writer.bytes = payload.bytes;
+    writer.length = payload.length;
+    writer.failed = 0;
+    writer_thread = CreateThread(NULL, 0, write_payload, &writer, 0, NULL);
+    if (writer_thread == NULL) { CloseHandle(job); fail("cannot start supervisor transport"); }
+    wait_handles[0] = process.hProcess;
+    wait_handles[1] = cancellation_event;
+    wait_handles[2] = writer_thread;
+    waited = WaitForMultipleObjects(3, wait_handles, FALSE, 60000);
+    if (waited == WAIT_OBJECT_0 + 2) {
+        if (InterlockedCompareExchange(&writer.failed, 0, 0) != 0) {
+            CloseHandle(job);
+            fail("supervisor input delivery failed");
+        }
+        waited = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+    }
+    if (waited == WAIT_OBJECT_0 + 1) {
+        if (WaitForSingleObject(process.hProcess, 4000) != WAIT_OBJECT_0) {
+            (void) TerminateJobObject(job, 130);
+            (void) WaitForSingleObject(process.hProcess, 5000);
+        }
+    } else if (waited != WAIT_OBJECT_0) {
+        CloseHandle(job);
+        fail("supervisor bootstrap timed out or failed");
+    }
+    (void) CancelSynchronousIo(writer_thread);
+    if (WaitForSingleObject(writer_thread, 5000) != WAIT_OBJECT_0
             || !GetExitCodeProcess(process.hProcess, &exit_code)) {
         CloseHandle(job);
-        fail("cannot observe Java backend exit");
+        fail("cannot observe supervisor completion");
     }
+    CloseHandle(writer_thread);
+    acknowledged = read_completion(completion_read, exit_code);
+    CloseHandle(completion_read);
     // Keep the process handle valid for a concurrently running console-close handler until ExitProcess.
-    // A successful Java exit may intentionally leave a helper process running, as direct Java does.
-    limits.BasicLimitInformation.LimitFlags = 0;
-    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, (DWORD) sizeof(limits))) {
-        CloseHandle(job);
-        fail("cannot finish child cleanup job");
+    // Only an acknowledged application exit releases intentional surviving helpers.
+    if (acknowledged && InterlockedCompareExchange(&cancellation_requested, 0, 0) == 0) {
+        limits.BasicLimitInformation.LimitFlags = 0;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, (DWORD) sizeof(limits))) {
+            CloseHandle(job);
+            fail("cannot finish supervisor cleanup job");
+        }
     }
     CloseHandle(job);
+    if (!acknowledged && InterlockedCompareExchange(&cancellation_requested, 0, 0) == 0)
+        fail("supervisor did not acknowledge application completion");
     LocalFree(argv);
     free(line);
     free(config.storage);
@@ -388,8 +697,12 @@ static int redirect_windows(void) {
     free(config_path);
     free(agent);
     free(java);
-    free(backend_config);
-    free(canonical_backend);
+    free(bootstrap_java);
+    free(supervisor);
+    free(policy);
+    free(agent_option);
+    free(filtered_environment);
+    free(payload.bytes);
     ExitProcess(exit_code);
 }
 

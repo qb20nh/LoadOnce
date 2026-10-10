@@ -1,6 +1,6 @@
 # External Minecraft launchers
 
-LoadOnce can run inside the JVM started by an external launcher. The agent JAR is loaded with `-javaagent:`; it is not an application launcher and starts no child JVM. The Fabric mod provides version-specific game hooks. The optional standalone launcher JAR is unnecessary for this path.
+Select LoadOnce's private Java executable in an external launcher to run its original command through the Java supervisor. The supervisor selects startup policy and loads the agent in the game JVM. The Fabric mod provides version-specific game hooks. The same agent can also be configured directly when only premain integration is wanted.
 
 ## JVM-argument setup
 
@@ -18,33 +18,36 @@ On a normal JDK, the status reports `crac_api=unavailable`. On a compatible CRaC
 
 ## Selecting a redirected Java executable
 
-A small native redirector can insert the agent automatically. It contains no cache or game logic. Linux forwards with `exec`, retaining the PID tracked by the launcher. Windows uses console `java.exe` and windowed `javaw.exe`, Unicode argument quoting and a kill-on-close job to stop the Java child if the redirector is terminated. No second wrapper JVM is started.
+A native executable starts a small Java supervisor, which launches the selected backend with the original arguments and the quiet agent. Cache and game policy remain in Java. Linux uses a native guardian to own the process tree; Windows uses console `java.exe` and windowed `javaw.exe` with atomic kill-on-close job assignment. The launcher tracks the native executable; supervisor and game PIDs differ from it.
 
 Build on the target platform with a C compiler: GCC on Linux, or CMake and MSVC on Windows. The Windows redirector requires Windows 10 version 1703 or newer for atomic child-job assignment.
 
 ```sh
-./gradlew redirectorDistribution redirectorSmoke
+./gradlew redirectorDistribution redirectorSmoke supervisorAotSmoke
 ```
 
-The distribution ZIP under `build/distributions/` contains the agent JAR and `redirectors/` executables for that platform. From the build tree, install into a new directory:
+The distribution ZIP under `build/distributions/` contains the supervisor/agent JARs and `redirectors/` executables for that platform. From the build tree, install into a new directory:
 
 ```sh
 java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller \
   --java-home /path/to/real/jdk --redirectors-dir build/native-redirectors \
-  --agent-jar build/libs/modid-1.0.0-agent.jar --output-dir /path/to/new/loadonce-runtime
+  --agent-jar build/libs/modid-1.0.0-agent.jar \
+  --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
 ```
 
-This command runs setup once. Normal game launches use the native executable directly. The installer copies the agent and forwarding binaries, writes their absolute paths into `bin/loadonce-runtime.conf`, and retains the selected backend JDK. It requires a new output directory and refuses to install inside that JDK. Do not move an installed redirector directory; rerun setup into a new location if paths change. Installation neither replaces system Java nor edits the original runtime.
+This command runs setup once. Normal game launches use the native executable directly. The installer copies the supervisor, agent and native binaries, writes fixed paths into `bin/loadonce-runtime.conf`, and writes startup policy to `loadonce-policy.conf`. It requires a new output directory outside the backend JDK. Do not move an installed directory; rerun setup into a new location if paths change.
 
-On Windows, run setup with the selected backend JDK. The installer rejects an agent path that this JVM's `native.encoding` cannot represent. The redirector forwards Unicode through the Windows wide-character API, but the selected Java launcher may convert arguments through the host's ANSI code page. Characters unavailable in that code page can become `?` in application arguments even with direct Java. Use paths and arguments supported by that runtime's native encoding; the redirector does not change it.
+The supervisor receives original arguments and environment through a bounded anonymous pipe. It does not use stdin for control data, expand argument files, or persist the launch command. The backend inherits the original cwd and raw stdin/stdout/stderr. JVM-option and native-loader environment variables apply to the backend once; they are removed from the supervisor's own environment. Both JVMs load the checkpoint guard. A completion packet releases intentional helpers after normal application exit, including nonzero exits; abrupt native/controller termination keeps process-tree cleanup armed.
+
+On Windows, run setup with the selected backend JDK. The installer requires its supervisor launch paths to round-trip through the setup JVM's `native.encoding`. Original arguments travel through the supervisor in UTF-8 and reach the backend through the wide-character Windows API. The selected Java launcher may then convert them through the host's ANSI code page, replacing unavailable characters with `?` even with direct Java. Use paths supported by that runtime's native encoding.
 
 On Windows, build with `.\gradlew.bat` and use a single-line PowerShell setup command, substituting your actual JDK and output paths:
 
 ```powershell
-java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller --java-home "C:\Java\jdk-25" --redirectors-dir build/native-redirectors --agent-jar build/libs/modid-1.0.0-agent.jar --output-dir "C:\Java\loadonce-runtime"
+java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller --java-home "C:\Java\jdk-25" --redirectors-dir build/native-redirectors --agent-jar build/libs/modid-1.0.0-agent.jar --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir "C:\Java\loadonce-runtime"
 ```
 
-When using an extracted distribution ZIP, replace the build-tree agent paths with `modid-1.0.0-agent.jar` and the native directory with `redirectors`.
+When using an extracted ZIP, use its agent/launcher JAR paths and `redirectors` directory.
 
 Point the external launcher at the installed executable:
 
@@ -57,13 +60,19 @@ Point the external launcher at the installed executable:
 
 Use the real JDK's required Java version. Changing the path does not make an incompatible Java version support a newer Minecraft release. Java-version probes are forwarded to the real JVM; the redirector never fabricates their output. Prism runs a checker JAR and sends its game launch script through stdin. Modrinth runs a Java probe class and parses stdout. These streams remain available throughout forwarding. The redirector also adds the quiet agent to probe applications; opting into verbose diagnostics changes their stderr output.
 
-This prototype does not inject additional AOT/restore flags, choose images or rewrite launcher sessions. Do not configure the agent both manually and through the redirector; duplicate premain registration is rejected before application main.
+The configured agent is injected once; an existing JVM argument referring to the installed agent is retained. Restore selection and launcher-session reconstruction remain disabled.
+
+Remove a previous LoadOnce agent option in JVM-option environment variables or an argument file when selecting the wrapper. These opaque sources are forwarded unchanged and are not inspected for duplicate agents.
 
 ## Leyden and restoration boundaries
 
-An agent starts after JVM startup-option parsing. It cannot enable `AOTCache`, change `AOTMode`, or turn an ordinary launch into `CRaCRestoreFrom` retroactively. Those choices belong to the external launcher's JVM arguments or a future prelaunch redirector policy.
+The executable wrapper applies AOT policy before launching the game JVM. Setup accepts `--aot auto|off|train`, `--cache /absolute/cache`, repeated `--input /absolute/mods-or-config`, and `--verbose`. Default `auto` reuses only a validated existing cache; missing, incompatible, corrupt or unsupported caches choose ordinary startup. `off` forwards normally. `train` explicitly runs the original application once and publishes only after successful exit and unchanged inputs. Change the installed policy's `aot=train` line to `aot=auto` after training; the installed artifact paths must remain the same.
 
-`./gradlew agentAotSmoke` verifies direct AOT training/use with the same agent on an isolated application. The real JDK 25 can map an AOT-linked cache with this premain-only agent. Keep runtime, agent JARs/options, classpath, mods and transformation behavior consistent between training and use; retrain when they change. A mapped cache can bypass a transformer added later even when the JVM accepts the cache. Current agent code installs no class transformers. The standalone cache supervisor's fingerprints and credential guards do not apply to manually supplied JVM options.
+Declare dynamically loaded mods, configuration, resources and native providers with `--input`. Known credential arguments/environments, checker/version probes, argument files and opaque Prism/MultiMC stdin entrypoints use ordinary startup without caching, even in `train` mode. Current authenticated Minecraft commands therefore use ordinary startup. Custom credentials loaded from arbitrary files are not automatically discoverable; use `off` until a host integration establishes a reusable boundary.
+
+Fingerprints and private immutable generations use the existing Java cache validation. A failure after starting the application never causes a replay. Windows wrappers preserve executable integration but choose ordinary startup because cache ACL validation is not implemented. Linux AOT reuse requires a supporting JDK and JAR classpaths; nonempty development class directories cannot be trained by JDK 25.
+
+`./gradlew supervisorAotSmoke` exercises policy through the installed executable; `agentAotSmoke` checks direct agent/AOT compatibility. Keep runtime, agent JARs/options, classpath, mods and transformation behavior consistent between training and use. A mapped cache can bypass a transformer added later even when the JVM accepts it. Current agent code installs no class transformers. Manually supplied AOT/restore flags remain the launcher's responsibility and bypass automatic cache selection.
 
 Do not treat successful agent startup or a Java probe as a Minecraft restoration test. The current game diagnostic observes an ordinary rendered menu. SDL/Vulkan resources, physical GPU/audio devices, input and authentication reattachment remain unimplemented. The selected CRaC runtime retains checkpointed environment keys omitted by a restore environment, and a fresh launch argument cannot replace credentials already held in the restored heap. A safe reusable game boundary must exclude that state and acquire authorized current launcher data after restoration. The agent's checkpoint veto remains active for this reason.
 

@@ -9,8 +9,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /** A single-launch JDK 25 class/linking cache wrapper; never saves a process heap. */
 public final class AotLauncher {
@@ -38,11 +40,24 @@ public final class AotLauncher {
 
     public static int train(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
                             Map<String, String> environment) throws IOException, InterruptedException {
-        return train(command, cache, inputs, sensitive, environment, SYSTEM);
+        return train(command, cache, inputs, sensitive, environment, SYSTEM, AotLauncher::message);
+    }
+
+    public static int train(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
+                            Map<String, String> environment, Consumer<String> diagnostics)
+            throws IOException, InterruptedException {
+        return train(command, cache, inputs, sensitive, environment, SYSTEM, diagnostics);
     }
 
     static int train(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
                      Map<String, String> environment, Executor executor) throws IOException, InterruptedException {
+        return train(command, cache, inputs, sensitive, environment, executor, AotLauncher::message);
+    }
+
+    static int train(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
+                     Map<String, String> environment, Executor executor, Consumer<String> diagnostics)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(diagnostics);
         command = originalCommand(command);
         inputs = List.copyOf(inputs);
         environment = Map.copyOf(environment);
@@ -62,10 +77,10 @@ public final class AotLauncher {
             Path stage = LauncherFiles.tempDirectory(root, ".train-");
             try {
                 Path archive = stage.resolve("cache.aot");
-                message("training runs the original application once; cache promotion requires a successful exit");
+                diagnostics.accept("training runs the original application once; cache promotion requires a successful exit");
                 int exit = executor.execute(withOptions(command, "-XX:AOTCacheOutput=" + archive), environment);
                 if (exit != 0) {
-                    message("training application exited unsuccessfully; no cache promoted and no replay attempted");
+                    diagnostics.accept("training application exited unsuccessfully; no cache promoted and no replay attempted");
                     return exit;
                 }
                 // Java has no portable umask. The enclosing directory was private
@@ -86,8 +101,8 @@ public final class AotLauncher {
                 }
                 LauncherFiles.sync(archive);
                 LauncherFiles.sync(stage);
-                publish(root, key, stage, archive);
-                message("AOT cache promoted; it contains JVM class data, not a Minecraft process checkpoint");
+                publish(root, key, stage, archive, diagnostics);
+                diagnostics.accept("AOT cache promoted; it contains JVM class data, not a Minecraft process checkpoint");
                 return 0;
             } finally {
                 if (Files.exists(stage, LinkOption.NOFOLLOW_LINKS)) LauncherFiles.deleteTree(stage);
@@ -97,16 +112,29 @@ public final class AotLauncher {
 
     public static int run(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
                           Map<String, String> environment) throws IOException, InterruptedException {
-        return run(command, cache, inputs, sensitive, environment, SYSTEM);
+        return run(command, cache, inputs, sensitive, environment, SYSTEM, AotLauncher::message);
+    }
+
+    public static int run(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
+                          Map<String, String> environment, Consumer<String> diagnostics)
+            throws IOException, InterruptedException {
+        return run(command, cache, inputs, sensitive, environment, SYSTEM, diagnostics);
     }
 
     static int run(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
                    Map<String, String> environment, Executor executor) throws IOException, InterruptedException {
+        return run(command, cache, inputs, sensitive, environment, executor, AotLauncher::message);
+    }
+
+    static int run(List<String> command, Path cache, List<Path> inputs, boolean sensitive,
+                   Map<String, String> environment, Executor executor, Consumer<String> diagnostics)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(diagnostics);
         command = originalCommand(command);
         inputs = List.copyOf(inputs);
         environment = Map.copyOf(environment);
         if (sensitive || JavaCommand.sensitive(command, environment)) {
-            message("sensitive launch inputs: ordinary startup");
+            diagnostics.accept("sensitive launch inputs: ordinary startup");
             return executor.execute(command, environment);
         }
         LauncherFiles.CacheLock lock = null;
@@ -122,13 +150,13 @@ public final class AotLauncher {
             archive = validatedArchive(root, JavaCommand.fingerprint(command, inputs, environment));
         } catch (IOException | UnsupportedOperationException | SecurityException failure) {
             if (lock != null) lock.close();
-            message("compatible complete AOT cache unavailable: ordinary startup");
+            diagnostics.accept("compatible complete AOT cache unavailable: ordinary startup");
             return executor.execute(command, environment);
         }
         // The child call is outside the fallback catch. Application failures and
         // process-start failures must never cause a second application execution.
         try (LauncherFiles.CacheLock acquired = lock) {
-            message("using validated AOT cache; JVM may discard incompatible data during this single launch");
+            diagnostics.accept("using validated AOT cache; JVM may discard incompatible data during this single launch");
             return executor.execute(withOptions(command, "-XX:AOTMode=auto", "-XX:AOTCache=" + archive), environment);
         }
     }
@@ -160,7 +188,7 @@ public final class AotLauncher {
         return archive;
     }
 
-    private static void publish(Path root, String key, Path stage, Path archive) throws IOException {
+    private static void publish(Path root, String key, Path stage, Path archive, Consumer<String> diagnostics) throws IOException {
         Path entry = LauncherFiles.privateDirectory(root.resolve(key));
         String generation = "generation-" + UUID.randomUUID().toString().replace("-", "");
         Path completed = entry.resolve(generation);
@@ -232,11 +260,11 @@ public final class AotLauncher {
                 for (Path child : children.toList()) {
                     if (!child.equals(completed) && child.getFileName().toString().matches("generation-[a-f0-9]{32}")) {
                         try { LauncherFiles.deleteTree(child); }
-                        catch (IOException ignored) { message("obsolete cache generation cleanup deferred"); }
+                        catch (IOException ignored) { diagnostics.accept("obsolete cache generation cleanup deferred"); }
                     }
                 }
             } catch (IOException ignored) {
-                message("obsolete cache generation cleanup deferred");
+                diagnostics.accept("obsolete cache generation cleanup deferred");
             }
         }
     }

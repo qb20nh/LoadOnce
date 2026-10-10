@@ -17,7 +17,9 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarFile;
@@ -25,23 +27,60 @@ import java.util.jar.JarFile;
 /** Installs a private Java executable selector without changing the selected JDK. */
 public final class RuntimeRedirectInstaller {
     private static final String CONFIG = "loadonce-runtime.conf";
+    private static final String POLICY = "loadonce-policy.conf";
+    private static final int MAX_INPUTS = 1024;
+    private static final int MAX_POLICY_BYTES = 1024 * 1024;
     private static final Set<PosixFilePermission> PRIVATE_DIRECTORY = PosixFilePermissions.fromString("rwx------");
     private static final Set<PosixFilePermission> PRIVATE_FILE = PosixFilePermissions.fromString("rw-------");
 
     private RuntimeRedirectInstaller() {}
 
+    /**
+     * Startup policy contains only persistent configuration, never a launcher's arguments or environment.
+     * Null bootstrap and cache paths select the application JDK and the private runtime's cache directory.
+     */
+    public record Options(Path bootstrapJavaHome, String aot, Path cache, List<Path> inputs, boolean verbose) {
+        public Options {
+            if (!"off".equals(aot) && !"auto".equals(aot) && !"train".equals(aot)) {
+                throw new IllegalArgumentException("AOT mode must be off, auto, or train");
+            }
+            inputs = List.copyOf(inputs);
+            if (inputs.size() > MAX_INPUTS) throw new IllegalArgumentException("Too many declared inputs");
+        }
+    }
+
     public static void main(String[] args) {
         try {
-            Map<String, Path> options = new HashMap<>();
-            Set<String> accepted = Set.of("--java-home", "--redirectors-dir", "--output-dir", "--agent-jar");
-            if (args.length != 8) throw new IllegalArgumentException(usage());
-            for (int index = 0; index < args.length; index += 2) {
-                if (!accepted.contains(args[index]) || options.putIfAbsent(args[index], Path.of(args[index + 1])) != null) {
-                    throw new IllegalArgumentException(usage());
+            Map<String, String> options = new HashMap<>();
+            List<Path> inputs = new ArrayList<>();
+            boolean verbose = false;
+            Set<String> accepted = Set.of("--java-home", "--redirectors-dir", "--output-dir", "--agent-jar",
+                    "--supervisor-jar", "--bootstrap-java-home", "--aot", "--cache");
+            for (int index = 0; index < args.length; index++) {
+                String option = args[index];
+                if (option.equals("--verbose")) {
+                    if (verbose) throw new IllegalArgumentException(usage());
+                    verbose = true;
+                } else if (option.equals("--input")) {
+                    if (++index >= args.length) throw new IllegalArgumentException(usage());
+                    inputs.add(Path.of(args[index]));
+                } else {
+                    if (!accepted.contains(option) || ++index >= args.length
+                            || options.putIfAbsent(option, args[index]) != null) {
+                        throw new IllegalArgumentException(usage());
+                    }
                 }
             }
-            Path output = install(options.get("--java-home"), options.get("--redirectors-dir"),
-                    options.get("--output-dir"), options.get("--agent-jar"));
+            for (String required : List.of("--java-home", "--redirectors-dir", "--output-dir", "--agent-jar", "--supervisor-jar")) {
+                if (!options.containsKey(required)) throw new IllegalArgumentException(usage());
+            }
+            Path home = Path.of(options.get("--java-home"));
+            Path outputDir = Path.of(options.get("--output-dir"));
+            Options policy = new Options(options.containsKey("--bootstrap-java-home")
+                    ? Path.of(options.get("--bootstrap-java-home")) : home, options.getOrDefault("--aot", "auto"),
+                    options.containsKey("--cache") ? Path.of(options.get("--cache")) : null, inputs, verbose);
+            Path output = install(home, Path.of(options.get("--redirectors-dir")), outputDir,
+                    Path.of(options.get("--agent-jar")), Path.of(options.get("--supervisor-jar")), policy);
             System.out.println("Installed LoadOnce runtime: " + output);
         } catch (IOException | IllegalArgumentException failure) {
             System.err.println("LoadOnce runtime setup failed: " + failure.getMessage());
@@ -49,19 +88,30 @@ public final class RuntimeRedirectInstaller {
         }
     }
 
-    public static Path install(Path javaHome, Path redirectorsDir, Path outputDir, Path agentJar) throws IOException {
+    public static Path install(Path javaHome, Path redirectorsDir, Path outputDir, Path agentJar, Path supervisorJar) throws IOException {
+        return install(javaHome, redirectorsDir, outputDir, agentJar, supervisorJar,
+                new Options(javaHome, "auto", null, List.of(), false));
+    }
+
+    public static Path install(Path javaHome, Path redirectorsDir, Path outputDir, Path agentJar,
+            Path supervisorJar, Path bootstrapJavaHome) throws IOException {
+        return install(javaHome, redirectorsDir, outputDir, agentJar, supervisorJar,
+                new Options(bootstrapJavaHome, "auto", null, List.of(), false));
+    }
+
+    public static Path install(Path javaHome, Path redirectorsDir, Path outputDir, Path agentJar,
+            Path supervisorJar, Options options) throws IOException {
         String os = System.getProperty("os.name", "");
         boolean windows = os.startsWith("Windows");
         if (!windows && !os.equals("Linux")) throw new IOException("Only Linux and Windows redirectors are supported");
         Path home = javaHome.toRealPath();
-        if (!Files.isDirectory(home)) throw new IOException("Java home must be a directory");
-        Path backend = readableFile(home.resolve("bin").resolve(windows ? "java.exe" : "java"));
-        if (!windows && !Files.isExecutable(backend)) throw new IOException("Java backend is not executable");
-        if (Files.exists(home.resolve("bin").resolve(CONFIG), LinkOption.NOFOLLOW_LINKS)
-                || Files.exists(backend.getParent().resolve(CONFIG), LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("Java home is already a LoadOnce redirect runtime");
-        }
+        Path bootstrapHome = options.bootstrapJavaHome() == null ? home : options.bootstrapJavaHome().toRealPath();
+        Path backend = backend(home, windows);
+        Path bootstrapBackend = backend(bootstrapHome, windows);
         String architecture = nativeArchitecture(backend, windows);
+        if (!nativeArchitecture(bootstrapBackend, windows).equals(architecture)) {
+            throw new IOException("Bootstrap and application Java backends have different architectures");
+        }
         Path binaries = redirectorsDir.toRealPath();
         if (!Files.isDirectory(binaries)) throw new IOException("Redirectors directory must be a directory");
         String[] names = windows ? new String[] {"java.exe", "javaw.exe"} : new String[] {"java"};
@@ -72,9 +122,6 @@ public final class RuntimeRedirectInstaller {
             }
             if (!windows && !Files.isExecutable(nativeBinary)) throw new IOException("Redirector is not executable: " + name);
         }
-        if (windows && !nativeArchitecture(readableFile(home.resolve("bin/javaw.exe")), true).equals(architecture)) {
-            throw new IOException("Java console and GUI backends have different architectures");
-        }
         Path sourceAgent = readableFile(agentJar);
         try (JarFile jar = new JarFile(sourceAgent.toFile())) {
             if (jar.getManifest() == null || !"dev.loadonce.agent.LoadOnceAgent".equals(
@@ -82,21 +129,42 @@ public final class RuntimeRedirectInstaller {
                 throw new IOException("Agent jar must declare the LoadOnce Premain-Class");
             }
         }
+        Path sourceSupervisor = readableFile(supervisorJar);
+        try (JarFile jar = new JarFile(sourceSupervisor.toFile())) {
+            var entry = jar.getJarEntry("dev/loadonce/supervisor/SupervisorMain.class");
+            if (entry == null || entry.isDirectory()) throw new IOException("Supervisor jar must contain the LoadOnce supervisor entrypoint");
+            try (var input = jar.getInputStream(entry)) {
+                byte[] magic = input.readNBytes(4);
+                if (magic.length != 4 || ByteBuffer.wrap(magic).getInt() != 0xcafebabe) {
+                    throw new IOException("Supervisor jar contains an invalid supervisor class");
+                }
+            }
+        }
         Path requestedOutput = outputDir.toAbsolutePath().normalize();
         Path parent = requestedOutput.getParent();
         if (parent == null || !Files.isDirectory(parent)) throw new IOException("Output parent must be an existing directory");
         parent = parent.toRealPath();
         Path output = parent.resolve(requestedOutput.getFileName());
-        Path backendDirectory = backend.getParent();
-        Path resolvedHome = backendDirectory.getFileName() != null && "bin".equalsIgnoreCase(backendDirectory.getFileName().toString())
-                ? backendDirectory.getParent() : home;
-        if (output.startsWith(home) || output.startsWith(resolvedHome)) {
-            throw new IOException("Private runtime output must be outside the selected JDK");
+        if (output.startsWith(home) || output.startsWith(resolvedHome(backend, home))
+                || output.startsWith(bootstrapHome) || output.startsWith(resolvedHome(bootstrapBackend, bootstrapHome))) {
+            throw new IOException("Private runtime output must be outside both selected JDKs");
         }
         if (Files.exists(output, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Private runtime output must be a new directory");
         String backendValue = configValue(backend);
+        String bootstrapValue = configValue(bootstrapBackend);
         String agentValue = configValue(output.resolve("loadonce-agent.jar"));
+        String supervisorValue = configValue(output.resolve("loadonce-supervisor.jar"));
+        String policyValue = configValue(output.resolve(POLICY));
         if (agentValue.indexOf('=') >= 0) throw new IOException("Private runtime path cannot contain the Java agent option separator");
+        Path cache = options.cache() == null ? output.resolve("cache") : options.cache().toAbsolutePath().normalize();
+        StringBuilder policy = new StringBuilder("aot=").append(options.aot()).append("\ncache=")
+                .append(configValue(cache)).append("\ninput.count=").append(options.inputs().size()).append('\n');
+        for (int index = 0; index < options.inputs().size(); index++) {
+            policy.append("input.").append(index).append('=').append(configValue(options.inputs().get(index).toAbsolutePath().normalize())).append('\n');
+        }
+        policy.append("verbose=").append(options.verbose()).append('\n');
+        byte[] policyBytes = policy.toString().getBytes(StandardCharsets.UTF_8);
+        if (policyBytes.length > MAX_POLICY_BYTES) throw new IOException("Runtime policy is too large");
         if (windows) {
             String nativeEncoding = System.getProperty("native.encoding");
             Charset nativeCharset;
@@ -104,12 +172,14 @@ public final class RuntimeRedirectInstaller {
                 if (nativeEncoding == null) throw new IllegalArgumentException();
                 nativeCharset = Charset.forName(nativeEncoding);
             } catch (IllegalArgumentException unavailable) {
-                throw new IOException("Windows native.encoding is unavailable; cannot validate the installed agent path");
+                throw new IOException("Windows native.encoding is unavailable; cannot validate the supervisor launch paths");
             }
-            if (!nativeCharset.newEncoder().canEncode(agentValue)
-                    || !nativeCharset.decode(nativeCharset.encode(agentValue)).toString().equals(agentValue)) {
-                throw new IOException("Installed agent path cannot be preserved by Windows native.encoding ("
-                        + nativeEncoding + "); choose a path using supported characters");
+            for (String value : List.of(bootstrapValue, agentValue, supervisorValue, policyValue)) {
+                if (!nativeCharset.newEncoder().canEncode(value)
+                        || !nativeCharset.decode(nativeCharset.encode(value)).toString().equals(value)) {
+                    throw new IOException("Supervisor launch path cannot be preserved by Windows native.encoding ("
+                            + nativeEncoding + "); choose a path using supported characters");
+                }
             }
         }
         boolean posix = Files.getFileStore(parent).supportsFileAttributeView("posix");
@@ -125,8 +195,14 @@ public final class RuntimeRedirectInstaller {
             }
             Path installedAgent = Files.copy(sourceAgent, stage.resolve("loadonce-agent.jar"));
             if (posix) Files.setPosixFilePermissions(installedAgent, PRIVATE_FILE);
+            Path installedSupervisor = Files.copy(sourceSupervisor, stage.resolve("loadonce-supervisor.jar"));
+            if (posix) Files.setPosixFilePermissions(installedSupervisor, PRIVATE_FILE);
+            Path installedPolicy = stage.resolve(POLICY);
+            Files.write(installedPolicy, policyBytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+            if (posix) Files.setPosixFilePermissions(installedPolicy, PRIVATE_FILE);
             Path config = stageBin.resolve(CONFIG);
-            Files.writeString(config, "java=" + backendValue + "\nagent=" + agentValue + "\n", StandardCharsets.UTF_8,
+            Files.writeString(config, "java=" + backendValue + "\nbootstrap-java=" + bootstrapValue
+                    + "\nsupervisor=" + supervisorValue + "\nagent=" + agentValue + "\n", StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             if (posix) Files.setPosixFilePermissions(config, PRIVATE_FILE);
             Path release = home.resolve("release");
@@ -138,8 +214,10 @@ public final class RuntimeRedirectInstaller {
             Files.createDirectory(output, permissions);
             outputCreated = true;
             Files.move(installedAgent, output.resolve("loadonce-agent.jar"));
+            Files.move(installedSupervisor, output.resolve("loadonce-supervisor.jar"));
+            Files.move(installedPolicy, output.resolve(POLICY));
             if (Files.exists(stage.resolve("release"))) Files.move(stage.resolve("release"), output.resolve("release"));
-            // Publish the executables together only after their fixed agent/config paths are ready.
+            // Publish the executables together only after the supervisor, policy, and agent paths are ready.
             Files.move(stageBin, output.resolve("bin"), StandardCopyOption.ATOMIC_MOVE);
             Files.delete(stage);
             return output;
@@ -148,6 +226,34 @@ public final class RuntimeRedirectInstaller {
             cleanup(stage, failure);
             throw failure;
         }
+    }
+
+    private static Path backend(Path home, boolean windows) throws IOException {
+        if (!Files.isDirectory(home)) throw new IOException("Java home must be a directory");
+        Path backend = readableFile(home.resolve("bin").resolve(windows ? "java.exe" : "java"));
+        if (!windows && !Files.isExecutable(backend)) throw new IOException("Java backend is not executable");
+        rejectRedirector(home.resolve("bin"));
+        rejectRedirector(backend.getParent());
+        if (windows) {
+            // The native GUI redirector selects the sibling of the canonical configured console executable.
+            Path gui = readableFile(backend.getParent().resolve("javaw.exe"));
+            rejectRedirector(gui.getParent());
+            if (!nativeArchitecture(gui, true).equals(nativeArchitecture(backend, true))) {
+                throw new IOException("Java console and GUI backends have different architectures");
+            }
+        }
+        return backend;
+    }
+
+    private static void rejectRedirector(Path directory) throws IOException {
+        if (Files.exists(directory.resolve(CONFIG), LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Java home is already a LoadOnce redirect runtime");
+        }
+    }
+
+    private static Path resolvedHome(Path backend, Path home) {
+        Path bin = backend.getParent();
+        return bin.getFileName() != null && "bin".equalsIgnoreCase(bin.getFileName().toString()) ? bin.getParent() : home;
     }
 
     private static Path readableFile(Path file) throws IOException {
@@ -215,6 +321,7 @@ public final class RuntimeRedirectInstaller {
     }
 
     private static String usage() {
-        return "Usage: RuntimeRedirectInstaller --java-home PATH --redirectors-dir PATH --output-dir PATH --agent-jar PATH";
+        return "Usage: RuntimeRedirectInstaller --java-home PATH --redirectors-dir PATH --output-dir PATH --agent-jar PATH --supervisor-jar PATH"
+                + " [--bootstrap-java-home PATH] [--aot off|auto|train] [--cache PATH] [--input PATH] [--verbose]";
     }
 }

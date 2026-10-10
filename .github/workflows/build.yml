@@ -26,7 +26,7 @@ jobs:
       - name: real Leyden smoke
         run: ./gradlew leydenSmoke agentAotSmoke
       - name: Linux Java executable redirection
-        run: ./gradlew redirectorSmoke redirectorDistribution
+        run: ./gradlew redirectorSmoke supervisorAotSmoke redirectorDistribution
       - name: software graphics and rendered audio smoke
         run: |
           sudo apt-get update
@@ -55,11 +55,12 @@ jobs:
           java-version: '25'
           distribution: 'microsoft'
       - name: Windows java and javaw forwarding
-        run: .\gradlew.bat --no-daemon --continue agentContractTest agentAotSmoke redirectorSmoke redirectorDistribution
+        run: .\gradlew.bat --no-daemon --continue agentContractTest agentAotSmoke redirectorSmoke supervisorAotSmoke redirectorDistribution
       - name: capture Windows redirector distribution
         uses: actions/upload-artifact@v7
         with:
           name: Windows-Redirectors
           path: |
             build/libs/*-agent.jar
+            build/libs/*-launcher.jar
             build/distributions/

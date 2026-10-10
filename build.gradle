@@ -14,7 +14,7 @@ repositories {
 
 // The runtime is shared with the mod; the native probe runs without Minecraft.
 sourceSets {
-	main { java.exclude 'dev/loadonce/agent/**' }
+	main { java.exclude 'dev/loadonce/agent/**', 'dev/loadonce/supervisor/**' }
 	contractTest {
 		compileClasspath += sourceSets.main.output
 		runtimeClasspath += sourceSets.main.output
@@ -166,7 +166,7 @@ tasks.withType(JavaCompile).configureEach {
 
 def standaloneRuntime = tasks.register('compileStandaloneRuntime', JavaCompile) {
 	source = fileTree('src/main/java/dev/loadonce') {
-		include 'runtime/**/*.java', 'launcher/**/*.java'
+		include 'runtime/**/*.java', 'launcher/**/*.java', 'supervisor/**/*.java'
 	}
 	classpath = files()
 	destinationDirectory = layout.buildDirectory.dir('classes/standaloneRuntime')
@@ -250,6 +250,7 @@ def nativeRedirectors = tasks.register('nativeRedirectors', Exec) {
 	group = 'build'
 	description = 'Builds private Java executable forwarding stubs for this host platform.'
 	inputs.file(nativeSourceFile)
+	inputs.file(layout.projectDirectory.file('native/linux_supervisor.h'))
 	inputs.file(layout.projectDirectory.file('native/CMakeLists.txt'))
 	outputs.files(new File(redirectorDirectory, nativePlatform == 'windows' ? 'java.exe' : 'java'))
 	if (nativePlatform == 'windows') {
@@ -278,16 +279,28 @@ tasks.register('configureNativeRedirectors', Exec) {
 tasks.register('redirectorSmoke', JavaExec) {
 	group = 'verification'
 	description = 'Verifies native forwarding, launcher probes, arguments and cancellation on this platform.'
-	dependsOn tasks.named('agentTestClasses'), agentJar, nativeRedirectors
+	dependsOn tasks.named('agentTestClasses'), agentJar, 'launcherJar', nativeRedirectors
 	classpath = sourceSets.agentTest.runtimeClasspath
 	mainClass = 'dev.loadonce.agent.RuntimeRedirectTest'
 	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--supervisor-jar', tasks.named('launcherJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--redirectors-dir', redirectorDirectory.absolutePath
+}
+
+tasks.register('supervisorAotSmoke', JavaExec) {
+	group = 'verification'
+	description = 'Verifies external executable startup policy against real AOT caches and fallback.'
+	dependsOn tasks.named('agentTestClasses'), agentJar, 'launcherJar', nativeRedirectors
+	classpath = sourceSets.agentTest.runtimeClasspath
+	mainClass = 'dev.loadonce.agent.SupervisorAotSmoke'
+	args '--agent-jar', agentJar.flatMap { it.archiveFile }.get().asFile.absolutePath,
+			'--supervisor-jar', tasks.named('launcherJar', Jar).flatMap { it.archiveFile }.get().asFile.absolutePath,
 			'--redirectors-dir', redirectorDirectory.absolutePath
 }
 
 // The subprocess harness quotes literal Windows arguments itself. Legacy
 // ProcessBuilder accepts those complete tokens without stripping interior quotes.
-['agentContractTest', 'agentAotSmoke', 'redirectorSmoke'].each { taskName ->
+['agentContractTest', 'agentAotSmoke', 'redirectorSmoke', 'supervisorAotSmoke'].each { taskName ->
 	tasks.named(taskName, JavaExec) {
 		jvmArgs '-Djdk.lang.Process.allowAmbiguousCommands=true'
 	}
@@ -295,11 +308,12 @@ tasks.register('redirectorSmoke', JavaExec) {
 
 tasks.register('redirectorDistribution', Zip) {
 	group = 'distribution'
-	description = 'Packages the agent and host-native redirectors for one-time installation.'
-	dependsOn agentJar, nativeRedirectors
+	description = 'Packages the Java supervisor, agent and native executables for external launchers.'
+	dependsOn agentJar, 'launcherJar', nativeRedirectors
 	archiveClassifier = "redirector-${nativePlatform}"
 	destinationDirectory = layout.buildDirectory.dir('distributions')
 	from(agentJar.flatMap { it.archiveFile })
+	from(tasks.named('launcherJar', Jar).flatMap { it.archiveFile })
 	from(redirectorDirectory) {
 		include 'java', 'java.exe', 'javaw.exe'
 		into 'redirectors'
@@ -393,7 +407,7 @@ java {
 }
 
 tasks.named('sourcesJar') {
-	from('src/main/java') { include 'dev/loadonce/agent/**' }
+	from('src/main/java') { include 'dev/loadonce/agent/**', 'dev/loadonce/supervisor/**' }
 }
 
 jar {

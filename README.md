@@ -1,8 +1,8 @@
 # LoadOnce
 
-LoadOnce prototypes JVM initialization reuse and native resource reconstruction. Prism, Modrinth, CurseForge and the vanilla launcher can keep control of Java: LoadOnce loads through an in-process Java agent and, for Fabric 26.3, the mod JAR. A private native `java`/`javaw` redirector can inject the agent when selecting a custom Java executable. The separate launcher JAR remains an optional tool for isolated cache/image experiments.
+LoadOnce prototypes JVM initialization reuse and native resource reconstruction. Prism, Modrinth, CurseForge and the vanilla launcher can select a private `java`/`javaw` executable that starts a Java supervisor, applies startup policy, then runs their original game command with the LoadOnce agent. The Fabric 26.3 mod provides game hooks. Normal launches require no manually invoked JAR launcher and no Python.
 
-External launchers select JVM startup flags; mod hooks own game resource integration. The agent installs early checkpoint protection and reports fixed capability identifiers without reading or logging game arguments. The current Minecraft integration observes conventional startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented. No Python is required.
+The supervisor supplies startup flags before the game JVM starts; mod hooks own game resource integration. The agent protects both JVMs from premature checkpoints. The current Minecraft integration observes ordinary startup to a rendered main menu; reusable Minecraft images and SDL restoration remain unimplemented.
 
 ## External launchers
 
@@ -14,16 +14,17 @@ Put `modid-1.0.0.jar` and Fabric API in the instance's mods directory, then add 
 
 The agent runs in that launcher's JVM, preserves its main class and authentication flow, and needs no extra Java process. An unmodified vanilla profile can load the agent; the game hooks require a Fabric profile matching Minecraft 26.3. The current agent denies CRaC checkpoints because the game resource/session boundary is not implemented. It does not automatically train, select or restore caches.
 
-For automatic injection through a custom Java executable, build the native redirector for your platform:
+For executable integration, build the native wrapper for your platform:
 
 ```sh
-./gradlew redirectorDistribution redirectorSmoke agentAotSmoke
+./gradlew redirectorDistribution redirectorSmoke supervisorAotSmoke
 java -cp build/libs/modid-1.0.0-agent.jar dev.loadonce.agent.RuntimeRedirectInstaller \
   --java-home /path/to/real/jdk --redirectors-dir build/native-redirectors \
-  --agent-jar build/libs/modid-1.0.0-agent.jar --output-dir /path/to/new/loadonce-runtime
+  --agent-jar build/libs/modid-1.0.0-agent.jar \
+  --supervisor-jar build/libs/modid-1.0.0-launcher.jar --output-dir /path/to/new/loadonce-runtime
 ```
 
-Select the new runtime's `bin/java` on Linux or `bin/java.exe`/`bin/javaw.exe` on Windows. The installer leaves the real JDK intact. The native executable forwards the original arguments and adds the Java agent; Linux preserves the process PID and Windows owns the forwarded JVM through a job object. These executables contain only forwarding code; LoadOnce logic and tests use Java. See [external-launcher setup and limits](docs/external-launchers.md).
+Select the new runtime's `bin/java` on Linux or `bin/java.exe`/`bin/javaw.exe` on Windows. The installer leaves the real JDK intact. The native executable owns the Java supervisor and its game process; cache policy lives in Java. Anonymous pipes carry the original arguments and environment in memory, while standard streams remain inherited. Default `auto` uses a validated existing AOT cache and otherwise starts normally; training is explicit. See [external-launcher setup and limits](docs/external-launchers.md).
 
 ## Build and Java checks
 
@@ -41,7 +42,7 @@ Use JDK 25 to build the Minecraft target and run the native tests:
 - `modid-1.0.0-agent.jar`: Java 17 premain agent and one-time redirector installer.
 - `modid-1.0.0-launcher.jar`: executable Java 17 launcher and lifecycle library, with no third-party dependencies.
 
-In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate.sh` to select the retained JDK and Gradle cache. The launcher's code targets Java 17; Leyden training requires a supporting JVM, and CRaC requires a CRaC-enabled JVM. The current cache/image privacy implementation requires POSIX ownership and permissions. Unsupported cache platforms select an ordinary application launch; Windows/javaw cache behavior has not been verified.
+In the prepared cloud workspace, use `source /workspace/.loadonce/setup/activate.sh` to select the retained JDK and Gradle cache. The supervisor targets Java 17; Leyden training requires a supporting JVM, and CRaC requires a CRaC-enabled JVM. The current cache/image privacy implementation requires POSIX ownership and permissions. Windows wrappers use ordinary startup until cache ACL validation exists.
 
 ## Optional standalone launcher and Leyden
 
