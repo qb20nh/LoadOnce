@@ -297,6 +297,10 @@ preparation, then start the whole display/audio/game chain inside a fresh user
 and network namespace. Bring up only loopback:
 
 ```sh
+(
+set -eu
+task_namespace_origin="$(/usr/lib/jvm/java-17-openjdk/bin/java -Xmx128m tools/RunFabricPackIsolated.java "$PRISM_ROOT" --namespace-origin)"
+trap 'rm -f -- "$task_namespace_origin"' EXIT
 /usr/bin/unshare --user --map-root-user --net --fork --forward-signals /bin/sh -c '
   set -eu
   /usr/bin/ip link set lo up
@@ -305,7 +309,15 @@ and network namespace. Bring up only loopback:
   --relative-input-module "$input_build_dir/private-relative-input.so" -- \
   /usr/lib/jvm/java-17-openjdk/bin/java -Xmx128m /home/cash/git/loadonce/tools/PrivateAudioSession.java -- \
   /usr/lib/jvm/java-17-openjdk/bin/java -Xmx128m /home/cash/git/loadonce/tools/RunFabricPackIsolated.java "$PRISM_ROOT" --pack fabulously
+)
 ```
+
+The primer captures the original namespace IDs before entering the private
+namespace and binds its mode-0600 proof to a live owned original-host ancestor.
+The peer verifies that owner through its actual ancestry, its process start
+time and UID/GID maps. Direct reads of host PID 1 namespace links are denied on
+this machine; they cannot serve as the valid-path check. Remove only the proof
+path created or verified by this primer when the private run finishes.
 
 The wrapper records and validates the selected module and exact owned headless
 Weston arguments. Omitting the option preserves the normal private display
@@ -435,6 +447,56 @@ exec nsenter --target "$task_helper_pid" --user --net --preserve-credentials -- 
 Keep `--preserve-credentials`: this mapped user namespace denies `setgroups`,
 so `--setuid` or `--setgid` can fail before the command starts. The same guarded
 entry can run the private input or screenshot commands in that session.
+
+For the full second-client check, `PrepareFabricLanPeer` prepares and launches a
+separate Fabulously Optimized peer in a second owned hardware/audio session,
+inside the host game's live loopback-only namespace. Start the host with the
+current `RunFabricPackIsolated` first: its run metadata now binds the launcher
+root, pack and display session. Pass that live run directory and LAN port to
+the preparation tool. It verifies the host listener, copies the unchanged
+48-JAR pack and its dependencies into the second session's private launcher
+root, and rechecks the source and copy fingerprints before launch.
+
+The temporary owning-account copy authorized for the host must remain available
+during preparation. The tool preserves that account and adds an explicitly
+selected Offline profile with a distinct UUID; renaming the original account
+would retain its UUID. Prism's normal ownership checks still apply. Preparation
+and launch share one credential lifetime; shutdown closes the process-start
+gate before stopping Prism and removing the generated account cache and its
+pending save files. No credential values enter the evidence manifest.
+
+Compile the four helpers with the existing Gson JAR, then run the synthetic and
+namespace contracts before staging an account. Use a new verification directory:
+
+```sh
+peer_verify_dir="$(mktemp -d /tmp/loadonce-peer-verify-XXXXXX)"
+peer_gson="$PRISM_ROOT/libraries/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar"
+/usr/lib/jvm/java-17-openjdk/bin/javac -J-Xmx128m -cp "$peer_gson" \
+  -d "$peer_verify_dir" tools/RunFabricPackIsolated.java \
+  tools/PrepareFabricLanPeer.java tools/FabricLanPeerContract.java \
+  tools/FabricLanPeerNamespaceContract.java
+/usr/lib/jvm/java-17-openjdk/bin/java -Xmx64m \
+  -cp "$peer_verify_dir:$peer_gson" FabricLanPeerContract
+/usr/lib/jvm/java-17-openjdk/bin/java -Xmx64m \
+  -cp "$peer_verify_dir" FabricLanPeerNamespaceContract
+```
+
+Inside the guarded namespace entry above, launch a second
+`HardwareDisplaySession` containing `PrivateAudioSession`, using
+`java -Xmx128m -cp "$peer_verify_dir:$peer_gson" PrepareFabricLanPeer HOST_RUN LAN_PORT`
+as its child command. Each client keeps its own private GPU display and audio
+sink. The peer uses Java 21, a 1536 MiB maximum heap, and the original pack's
+graphics settings. It cannot launch outside the verified loopback-only
+namespace or reuse the main display session.
+
+The 24 synthetic contracts and Java 17 compilation passed. A separate 64 MiB
+namespace contract reproduced the original PID 1 permission failure, then
+passed real isolated admission and rejected host, stale and public-mode proofs.
+Actual peer login,
+movement, a shared-world block action, disconnect/rejoin and normal saves/exits
+remain **unverified**. Host memory pressure prevented starting the two-client
+test in this continuation. This setup does not establish authenticated Internet
+multiplayer or hardware warm restoration.
 
 ## Experimental VM restoration
 

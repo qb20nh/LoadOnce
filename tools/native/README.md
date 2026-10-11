@@ -43,3 +43,7 @@ uses `gfxstream-snapshot-validation.patch` to build the external renderer's
 standalone snapshot API and assert physical GPU identity in its GLES tests.
 `GpuResourceSnapshotSmoke.java` coordinates resource capture and three fresh
 restores through Java 25 FFM. It does not enable Minecraft restoration.
+
+`kumquat-private-storage.patch` applies to the pinned native transport described
+in that experiment. It requires private snapshot storage and refuses existing
+socket paths. It does not implement fresh-server resource or backing restoration.

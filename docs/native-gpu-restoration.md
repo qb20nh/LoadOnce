@@ -122,6 +122,33 @@ restore must preserve that wrapper state and substitute connected sockets and
 matching shared mappings, using private storage. CRIU's inherited Unix socket
 and memfd support is a possible transport mechanism, not a completed integration.
 
+The pinned Kumquat server also builds locally with Cargo's `gfxstream` feature,
+without Python or a system installation. The private pkg-config description must
+define `GFXSTREAM_UNSTABLE`; merely setting `GFXSTREAM_PATH` skips that detection
+and disables the Rust snapshot implementation. The release build linked the
+existing backend, emitted `gfxstream_unstable`, imported both snapshot and restore
+symbols, and passed `--help`. This is build/link validation only: no server or
+Minecraft client has been restored through it. Evidence is retained in
+`build/local-tools/gpu-snapshot/kumquat-build.log` and
+`rutabaga-target/release/build/rutabaga_gfx-*/output`.
+
+Apply `tools/native/kumquat-private-storage.patch` to Rutabaga revision
+`ced6af5b1135173c269a037e06213e8a263de271` before runtime tests. This transport
+patch requires `--snapshot-directory` pointing to an existing caller-owned
+mode-0700 directory, validates it before save/restore, and refuses existing
+socket paths without deleting them. It removes the shared `/tmp` snapshot
+fallback. Four offline storage tests and the patched release build passed; clean
+apply and reverse checks passed. Allocator, resource identity, backing FD and
+CPU restoration are still unimplemented. Imported-fence compatibility between
+the pinned Rust and C interfaces has not been verified.
+
+The native client still needs a Mesa gfxstream ICD built with
+`-Dvirtgpu_kumquat=true`. Arch's matching `vulkan-gfxstream` package omits that
+option and builds a null Kumquat transport stub. Its installation would not
+unblock this route. A private client-driver build needs Mesa's Meson build tools;
+it remains pending clarification of the handover's no-Python constraint. No
+system graphics driver or desktop session has been changed.
+
 The observed CRIU `[uprobes]` mapping is contingent kernel instrumentation state.
 Current CRIU rejects it unless explicitly told to skip it. Fresh owned JVMs must
 be checked at checkpoint time; this experiment does not remove host probes or
@@ -131,4 +158,7 @@ Provider references: [snapshot design](https://github.com/google/gfxstream/blob/
 [GPU-image save/load](https://github.com/google/gfxstream/blob/07ee40efb0e7037a9a9b7fe59071e7c4997e7cbe/host/vulkan/color_buffer_vk.cpp),
 [frontend snapshot implementation](https://github.com/google/gfxstream/blob/07ee40efb0e7037a9a9b7fe59071e7c4997e7cbe/host/virtio_gpu_frontend.cpp),
 [native Kumquat route](https://github.com/magma-gpu/rutabaga_gfx/blob/ced6af5b1135173c269a037e06213e8a263de271/README.md),
+[Kumquat Cargo feature detection](https://github.com/magma-gpu/rutabaga_gfx/blob/ced6af5b1135173c269a037e06213e8a263de271/build.rs),
+[Arch Mesa build recipe](https://gitlab.archlinux.org/archlinux/packaging/packages/mesa/-/raw/main/PKGBUILD),
+[Mesa 26.2.4 Kumquat build selection](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.2.4/src/gfxstream/guest/platform/kumquat/meson.build),
 [CRIU uprobes handling](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/proc_parse.c).

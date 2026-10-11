@@ -1,0 +1,323 @@
+diff --git a/kumquat/server/src/kumquat.rs b/kumquat/server/src/kumquat.rs
+index cd605a6..57498ed 100644
+--- a/kumquat/server/src/kumquat.rs
++++ b/kumquat/server/src/kumquat.rs
+@@ -15,6 +15,7 @@ use magma_gpu::util::WaitTimeout;
+ use crate::kumquat_gpu::KumquatGpu;
+ use crate::kumquat_gpu::KumquatGpuConnection;
+ use crate::kumquat_gpu::KumquatGpuResult;
++use crate::private_storage;
+ 
+ enum KumquatConnection {
+     GpuListener,
+@@ -82,6 +83,7 @@ pub struct KumquatBuilder {
+     capset_names_opt: Option<String>,
+     gpu_socket_opt: Option<String>,
+     renderer_features_opt: Option<String>,
++    snapshot_directory_opt: Option<PathBuf>,
+ }
+ 
+ impl KumquatBuilder {
+@@ -90,6 +92,7 @@ impl KumquatBuilder {
+             capset_names_opt: None,
+             gpu_socket_opt: None,
+             renderer_features_opt: None,
++            snapshot_directory_opt: None,
+         }
+     }
+ 
+@@ -108,6 +111,11 @@ impl KumquatBuilder {
+         self
+     }
+ 
++    pub fn set_snapshot_directory(mut self, directory: PathBuf) -> KumquatBuilder {
++        self.snapshot_directory_opt = Some(directory);
++        self
++    }
++
+     pub fn build(self) -> KumquatGpuResult<Kumquat> {
+         let connection_id: u64 = 0;
+         let mut wait_ctx = WaitContext::new()?;
+@@ -116,15 +124,22 @@ impl KumquatBuilder {
+         let mut connections: Map<u64, KumquatConnection> = Default::default();
+ 
+         if let Some(gpu_socket) = self.gpu_socket_opt {
+-            // Remove path if it exists
+             let path = PathBuf::from(&gpu_socket);
+-            let _ = std::fs::remove_file(&path);
++            private_storage::validate_socket_path(&path).map_err(MagmaGpuError::IoError)?;
++            let snapshot_directory =
++                self.snapshot_directory_opt
++                    .ok_or(MagmaGpuError::WithContext(
++                        "explicit private snapshot directory is required",
++                    ))?;
++            private_storage::validate_directory(&snapshot_directory)
++                .map_err(MagmaGpuError::IoError)?;
+ 
+             // Should not panic, since main.rs always calls set_capset_names and
+             // set_renderer_features, even with the empty string.
+             kumquat_gpu_opt = Some(KumquatGpu::new(
+                 self.capset_names_opt.unwrap(),
+                 self.renderer_features_opt.unwrap(),
++                snapshot_directory,
+             )?);
+ 
+             let gpu_listener = Listener::bind(path)?;
+diff --git a/kumquat/server/src/kumquat_gpu/mod.rs b/kumquat/server/src/kumquat_gpu/mod.rs
+index 2cfd2a2..3122403 100644
+--- a/kumquat/server/src/kumquat_gpu/mod.rs
++++ b/kumquat/server/src/kumquat_gpu/mod.rs
+@@ -6,7 +6,7 @@ use std::collections::btree_map::Entry;
+ use std::collections::BTreeMap as Map;
+ use std::collections::BTreeSet as Set;
+ use std::os::raw::c_void;
+-use std::path::Path;
++use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ 
+@@ -42,7 +42,7 @@ use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
+ use rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED;
+ use thiserror::Error;
+ 
+-const SNAPSHOT_DIR: &str = "/tmp/";
++use crate::private_storage;
+ 
+ #[sorted]
+ #[non_exhaustive]
+@@ -104,10 +104,15 @@ pub struct KumquatGpu {
+     fence_state: FenceState,
+     id_allocator: u32,
+     resources: Map<u32, KumquatGpuResource>,
++    snapshot_directory: PathBuf,
+ }
+ 
+ impl KumquatGpu {
+-    pub fn new(capset_names: String, renderer_features: String) -> KumquatGpuResult<KumquatGpu> {
++    pub fn new(
++        capset_names: String,
++        renderer_features: String,
++        snapshot_directory: PathBuf,
++    ) -> KumquatGpuResult<KumquatGpu> {
+         let capset_mask = calculate_capset_mask(capset_names.as_str().split(":"));
+         if capset_mask == 0 {
+             return Err(MagmaGpuError::Unsupported.into());
+@@ -140,6 +145,7 @@ impl KumquatGpu {
+             fence_state,
+             id_allocator: 0,
+             resources: Default::default(),
++            snapshot_directory,
+         })
+     }
+ 
+@@ -478,7 +484,11 @@ impl KumquatGpuConnection {
+                         .context_attach_resource(cmd.ctx_id, resource_id)?;
+                 }
+                 KumquatGpuProtocol::SnapshotSave => {
+-                    kumquat_gpu.rutabaga.snapshot(Path::new(SNAPSHOT_DIR))?;
++                    private_storage::validate_directory(&kumquat_gpu.snapshot_directory)
++                        .map_err(MagmaGpuError::IoError)?;
++                    kumquat_gpu
++                        .rutabaga
++                        .snapshot(&kumquat_gpu.snapshot_directory)?;
+ 
+                     let resp = kumquat_gpu_protocol_ctrl_hdr {
+                         type_: KUMQUAT_GPU_PROTOCOL_RESP_OK_SNAPSHOT,
+@@ -488,7 +498,11 @@ impl KumquatGpuConnection {
+                     self.stream.write(KumquatGpuProtocolWrite::Cmd(resp))?;
+                 }
+                 KumquatGpuProtocol::SnapshotRestore => {
+-                    kumquat_gpu.rutabaga.restore(Path::new(SNAPSHOT_DIR))?;
++                    private_storage::validate_directory(&kumquat_gpu.snapshot_directory)
++                        .map_err(MagmaGpuError::IoError)?;
++                    kumquat_gpu
++                        .rutabaga
++                        .restore(&kumquat_gpu.snapshot_directory)?;
+ 
+                     let resp = kumquat_gpu_protocol_ctrl_hdr {
+                         type_: KUMQUAT_GPU_PROTOCOL_RESP_OK_SNAPSHOT,
+diff --git a/kumquat/server/src/main.rs b/kumquat/server/src/main.rs
+index a204076..eabfbb3 100644
+--- a/kumquat/server/src/main.rs
++++ b/kumquat/server/src/main.rs
+@@ -4,6 +4,7 @@
+ 
+ mod kumquat;
+ mod kumquat_gpu;
++mod private_storage;
+ 
+ use clap::Parser;
+ use kumquat::KumquatBuilder;
+@@ -26,6 +27,10 @@ struct Args {
+     #[arg(long, default_value = "/tmp/kumquat-gpu-0")]
+     gpu_socket_path: String,
+ 
++    /// Existing owned mode-0700 directory for private snapshot save/restore.
++    #[arg(long)]
++    snapshot_directory: std::path::PathBuf,
++
+     /// Opaque renderer specific features
+     #[arg(long, default_value = "")]
+     renderer_features: String,
+@@ -41,6 +46,7 @@ fn main() -> KumquatGpuResult<()> {
+     let mut kumquat = KumquatBuilder::new()
+         .set_capset_names(args.capset_names)
+         .set_gpu_socket((!args.gpu_socket_path.is_empty()).then_some(args.gpu_socket_path))
++        .set_snapshot_directory(args.snapshot_directory)
+         .set_renderer_features(args.renderer_features)
+         .build()?;
+ 
+diff --git a/kumquat/server/src/private_storage.rs b/kumquat/server/src/private_storage.rs
+new file mode 100644
+index 0000000..55b515f
+--- /dev/null
++++ b/kumquat/server/src/private_storage.rs
+@@ -0,0 +1,148 @@
++// Copyright 2026 The LoadOnce Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++use std::fs;
++use std::io;
++use std::os::unix::ffi::OsStrExt;
++use std::os::unix::fs::MetadataExt;
++use std::path::{Component, Path, PathBuf};
++
++extern "C" {
++    fn geteuid() -> u32;
++}
++
++fn invalid(path: &Path, reason: &str) -> io::Error {
++    io::Error::new(
++        io::ErrorKind::InvalidInput,
++        format!(
++            "private storage {}: {}; choose an absolute path in an existing owned mode-0700 directory without symlinks",
++            path.display(), reason
++        ),
++    )
++}
++
++pub fn validate_directory(path: &Path) -> io::Result<()> {
++    if !path.is_absolute() {
++        return Err(invalid(path, "relative path"));
++    }
++    let mut current = PathBuf::new();
++    for component in path.components() {
++        match component {
++            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
++            _ => return Err(invalid(path, "non-normal path component")),
++        }
++        let metadata = fs::symlink_metadata(&current)?;
++        if !metadata.is_dir() || metadata.file_type().is_symlink() {
++            return Err(invalid(path, "symlink or non-directory component"));
++        }
++    }
++    let metadata = fs::symlink_metadata(path)?;
++    // SAFETY: geteuid has no arguments and returns the calling process's effective UID.
++    let uid = unsafe { geteuid() };
++    if metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
++        return Err(invalid(
++            path,
++            "directory must be owned by the effective UID with mode 0700",
++        ));
++    }
++    Ok(())
++}
++
++pub fn validate_socket_path(path: &Path) -> io::Result<()> {
++    let bytes = path.as_os_str().as_bytes();
++    if !path.is_absolute() || bytes.len() > 107 || bytes.contains(&0) || bytes.ends_with(b"/") {
++        return Err(invalid(
++            path,
++            "invalid absolute Unix socket pathname (maximum 107 bytes)",
++        ));
++    }
++    let parent = path
++        .parent()
++        .ok_or_else(|| invalid(path, "missing parent"))?;
++    validate_directory(parent)?;
++    if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
++        return Err(invalid(path, "invalid socket basename"));
++    }
++    match fs::symlink_metadata(path) {
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
++        Err(error) => Err(error),
++        Ok(_) => Err(invalid(
++            path,
++            "socket pathname already exists; refusing to overwrite",
++        )),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++    struct PrivateDir(PathBuf);
++    impl PrivateDir {
++        fn new() -> Self {
++            let path = std::env::temp_dir().join(format!(
++                "kumquat-storage-test-{}-{}",
++                std::process::id(),
++                NEXT.fetch_add(1, Ordering::Relaxed)
++            ));
++            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
++            Self(path)
++        }
++    }
++    impl Drop for PrivateDir {
++        fn drop(&mut self) {
++            fs::remove_dir_all(&self.0).unwrap();
++        }
++    }
++
++    #[test]
++    fn accepts_private_directory_and_absent_socket() {
++        let directory = PrivateDir::new();
++        validate_directory(&directory.0).unwrap();
++        validate_socket_path(&directory.0.join("gpu")).unwrap();
++    }
++
++    #[test]
++    fn rejects_relative_public_and_parent_paths() {
++        let directory = PrivateDir::new();
++        assert!(validate_directory(Path::new("relative")).is_err());
++        assert!(validate_directory(&directory.0.join("..")).is_err());
++        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(validate_directory(&directory.0).is_err());
++        assert!(validate_socket_path(&directory.0.join("gpu")).is_err());
++    }
++
++    #[test]
++    fn rejects_symlink_directory_and_existing_socket_without_deleting() {
++        let directory = PrivateDir::new();
++        let alias = directory.0.join("alias");
++        symlink(&directory.0, &alias).unwrap();
++        assert!(validate_directory(&alias).is_err());
++        assert!(validate_socket_path(&alias.join("gpu")).is_err());
++        let file = directory.0.join("gpu");
++        fs::write(&file, b"retain").unwrap();
++        assert!(validate_socket_path(&file).is_err());
++        assert_eq!(fs::read(&file).unwrap(), b"retain");
++        let link = directory.0.join("gpu-link");
++        symlink(&file, &link).unwrap();
++        assert!(validate_socket_path(&link).is_err());
++        assert!(fs::symlink_metadata(&link)
++            .unwrap()
++            .file_type()
++            .is_symlink());
++    }
++
++    #[test]
++    fn rejects_oversized_socket_and_changed_directory() {
++        let directory = PrivateDir::new();
++        assert!(validate_socket_path(&directory.0.join("x".repeat(108))).is_err());
++        validate_directory(&directory.0).unwrap();
++        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o770)).unwrap();
++        assert!(validate_directory(&directory.0).is_err());
++    }
++}

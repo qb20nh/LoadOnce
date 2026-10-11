@@ -8,12 +8,17 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.HexFormat;
+import java.util.HashSet;
+import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import javax.imageio.ImageIO;
@@ -27,7 +32,13 @@ import javax.swing.SwingUtilities;
 class RunFabricPackIsolated {
     private static long launchNanos;
     private static boolean menuRecorded;
-    private static final Path PRISM_ROOT = Path.of("/run/media/cash/Windows/LoadOnce-fabric-tests-2026-10-11/prism");
+    private static Path activePrismRoot;
+    private static String activeInstance;
+    private static final Object PEER_LIFETIME = new Object();
+    private static boolean peerClosed;
+    private static Process peerProcess;
+    private static Map<Long, ProcessHandle> peerOwned;
+    static final Path PRISM_ROOT = Path.of("/run/media/cash/Windows/LoadOnce-fabric-tests-2026-10-11/prism");
     private record Pack(String instance, int javaMajor, int minimum, int maximum) {
         String javaExecutable() { return "/usr/lib/jvm/java-" + javaMajor + "-openjdk/bin/java"; }
     }
@@ -43,9 +54,10 @@ class RunFabricPackIsolated {
 
     public static void main(String[] args) throws Exception {
         boolean send = args.length >= 2 && args[1].equals("--send");
+        boolean peer = args.length >= 2 && args[1].equals("--peer");
         if (args.length < 1 || (send ? args.length < 4 || args.length > 19
-                : args.length > 4)) {
-            throw new IllegalArgumentException("Use RunFabricPackIsolated.java PRIVATE_PRISM_ROOT [--pack prominence|fabulously|spectral] [--display-check], or PRIVATE_PRISM_ROOT --send RUN_DIRECTORY 'COMMAND'...");
+                : peer ? args.length != 7 : args.length > 4)) {
+            throw new IllegalArgumentException("Use RunFabricPackIsolated.java PRIVATE_PRISM_ROOT [--pack prominence|fabulously|spectral] [--display-check], PRIVATE_PRISM_ROOT --send RUN_DIRECTORY 'COMMAND'..., or PRIVATE_PRISM_ROOT --peer PEER_ROOT --host-run RUN_DIRECTORY --port PORT");
         }
         require("Linux".equals(System.getProperty("os.name")), "Private display checks require Linux");
         Path root = Path.of(args[0]);
@@ -53,8 +65,27 @@ class RunFabricPackIsolated {
         rejectSymlinks(root);
         require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS), "Private Prism root is missing: " + root);
         root = root.toRealPath();
+        if (args.length == 2 && args[1].equals("--namespace-origin")) {
+            var owner = Files.getOwner(Path.of("/proc/self"));
+            ProcessHandle origin = ProcessHandle.current();
+            var candidate = origin.parent();
+            for (int depth = 0; depth < 64 && candidate.isPresent(); depth++) {
+                var ancestor = candidate.get();
+                candidate = ancestor.parent();
+                Path process = Path.of("/proc", Long.toString(ancestor.pid()));
+                if (ancestor.isAlive() && Files.getOwner(process).equals(owner)
+                        && Files.readString(process.resolve("uid_map")).strip().replaceAll("\\s+", " ").equals("0 0 4294967295")) origin = ancestor;
+            }
+            System.out.println(captureNamespaceOrigin(origin));
+            return;
+        }
         if (send) {
             sendInput(root, Path.of(args[2]), java.util.Arrays.asList(args).subList(3, args.length));
+            return;
+        }
+        if (peer) {
+            require(args[3].equals("--host-run") && args[5].equals("--port"), "Invalid bounded peer launch options");
+            runPeer(root, Path.of(args[2]), Path.of(args[4]), Integer.parseInt(args[6]));
             return;
         }
         Pack pack = pack("prominence");
@@ -89,6 +120,316 @@ class RunFabricPackIsolated {
         System.out.println("Private account file exists; its contents were not read and license validity remains Prism's responsibility.");
         initializePrismConfig(root);
         runPrism(root, ownedOutput(root), pack);
+    }
+
+    static void guardPeerEnvironment() throws Exception {
+        guardDisplay(false);
+        peerSession();
+    }
+
+    static Path peerSession() throws IOException {
+        String authority = System.getenv("XAUTHORITY");
+        require(authority != null, "Peer launch requires a private hardware session");
+        Path session = Path.of(authority).getParent();
+        require(session != null && session.isAbsolute() && session.normalize().equals(session), "Invalid peer session path");
+        privatePeerObject(session, true, session);
+        privatePeerObject(session.resolve("hardware-display.properties"), false, session);
+        return session;
+    }
+
+    static void privatePeerObject(Path path, boolean directory, Path session) throws IOException {
+        rejectSymlinks(path);
+        require((directory ? Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) : Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+                && Files.getOwner(path, LinkOption.NOFOLLOW_LINKS).equals(Files.getOwner(session, LinkOption.NOFOLLOW_LINKS))
+                && Files.getPosixFilePermissions(path, LinkOption.NOFOLLOW_LINKS).stream().allMatch(p -> p.name().startsWith("OWNER_")),
+                "Peer objects must be owned and private: " + path);
+    }
+
+    static Properties peerProperties(Path path) throws IOException {
+        rejectSymlinks(path);
+        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.size(path) <= 16384, "Invalid peer metadata file: " + path);
+        var properties = new Properties();
+        try (var input = Files.newInputStream(path)) { properties.load(input); }
+        return properties;
+    }
+
+    static String peerHash(Path path) throws Exception {
+        rejectSymlinks(path);
+        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.size(path) <= 64L * 1024 * 1024,
+                "Invalid peer fingerprint input: " + path);
+        var digest = MessageDigest.getInstance("SHA-256");
+        try (var input = Files.newInputStream(path)) {
+            byte[] buffer = new byte[16384];
+            for (int count; (count = input.read(buffer)) != -1;) digest.update(buffer, 0, count);
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    static String peerMods(Path directory) throws Exception {
+        rejectSymlinks(directory);
+        require(Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS), "FO mods directory missing");
+        var hashes = new TreeMap<String, String>();
+        try (var files = Files.walk(directory)) {
+            for (Path file : files.toList()) {
+                rejectSymlinks(file);
+                if (file.toString().endsWith(".jar")) {
+                    require(file.getParent().equals(directory), "Nested peer mod JAR rejected");
+                    hashes.put(file.getFileName().toString(), peerHash(file));
+                }
+            }
+        }
+        require(hashes.size() == 48, "FO peer requires the exact 48 physical mod JARs");
+        var digest = MessageDigest.getInstance("SHA-256");
+        hashes.forEach((name, hash) -> digest.update((name + "\0" + hash + "\n").getBytes(StandardCharsets.UTF_8)));
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    static void peerNamespaces(ProcessHandle host) throws IOException {
+        for (String map : List.of("uid_map", "gid_map")) {
+            require(Files.readString(Path.of("/proc/self", map)).strip().replaceAll("\\s+", " ").equals("0 1000 1"),
+                    "Peer namespace must map only UID/GID 0 to 1000");
+        }
+        require(Files.readString(Path.of("/proc/self/setgroups")).strip().equals("deny"), "Peer namespace requires denied setgroups");
+        var original = originalHostNamespaces();
+        var hostStarted = host.info().startInstant();
+        require(host.isAlive() && hostStarted.isPresent(), "Peer host namespace owner is not live");
+        for (String name : List.of("user", "net")) {
+            Path self = Files.readSymbolicLink(Path.of("/proc/self/ns", name));
+            Path remote = Files.readSymbolicLink(Path.of("/proc", Long.toString(host.pid()), "ns", name));
+            require(self.equals(remote) && !self.equals(original.get(name)),
+                    "Peer and host require the same isolated " + name + " namespace");
+        }
+        require(host.isAlive() && host.info().startInstant().equals(hostStarted), "Peer host namespace owner changed");
+        var interfaces = java.net.NetworkInterface.getNetworkInterfaces();
+        int count = 0;
+        while (interfaces.hasMoreElements()) {
+            var network = interfaces.nextElement();
+            require(network.getName().equals("lo"), "Peer namespace has an external network interface");
+            count++;
+            var addresses = network.getInetAddresses();
+            while (addresses.hasMoreElements()) require(addresses.nextElement().isLoopbackAddress(), "Peer namespace has a non-loopback address");
+        }
+        require(count == 1, "Peer namespace requires only loopback");
+    }
+
+    private static Map<String, Path> originalHostNamespaces() throws IOException {
+        var owner = Files.getOwner(Path.of("/proc/self"));
+        var parent = ProcessHandle.current().parent();
+        for (int depth = 0; depth < 64 && parent.isPresent(); depth++) {
+            var ancestor = parent.get();
+            parent = ancestor.parent();
+            var started = ancestor.info().startInstant();
+            if (!ancestor.isAlive() || started.isEmpty()) continue;
+            Path process = Path.of("/proc", Long.toString(ancestor.pid()));
+            try {
+                if (!Files.getOwner(process).equals(owner)) continue;
+                String status = Files.readString(process.resolve("status"));
+                if (status.lines().noneMatch(line -> line.startsWith("Uid:")
+                        && line.substring(4).strip().replaceAll("\\s+", " ").equals("0 0 0 0"))) continue;
+                if (!Files.readString(process.resolve("uid_map")).strip().replaceAll("\\s+", " ").equals("0 4294967295 4294967295")
+                        || !Files.readString(process.resolve("gid_map")).strip().replaceAll("\\s+", " ").equals("0 4294967295 4294967295")) continue;
+                Path marker = namespaceOriginPath(ancestor.pid(), started.get());
+                privatePeerObject(marker, false, Path.of("/proc", Long.toString(ProcessHandle.current().pid())));
+                require(Files.getPosixFilePermissions(marker).equals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")), "Namespace origin proof must be mode 0600");
+                var proof = peerProperties(marker);
+                if (!Long.toString(ancestor.pid()).equals(proof.getProperty("originPid"))
+                        || !started.get().toString().equals(proof.getProperty("originStarted"))
+                        || !"1000".equals(proof.getProperty("originUid"))) continue;
+                require(proof.getProperty("user", "").matches("user:\\[[0-9]+]"), "Invalid original user namespace proof");
+                require(proof.getProperty("net", "").matches("net:\\[[0-9]+]"), "Invalid original network namespace proof");
+                var namespaces = Map.of("user", Path.of(proof.getProperty("user")), "net", Path.of(proof.getProperty("net")));
+                if (ancestor.isAlive() && ancestor.info().startInstant().equals(started)) return namespaces;
+            } catch (IOException unavailable) {
+                // Try another owned ancestor; an inaccessible process cannot prove isolation.
+            }
+        }
+        throw new IOException("Cannot prove original host namespaces from a live owned ancestor");
+    }
+
+    private static Path namespaceOriginPath(long pid, java.time.Instant started) {
+        return Path.of("/tmp", "loadonce-peer-origin-" + pid + "-" + started.toEpochMilli() + ".properties");
+    }
+
+    static Path captureNamespaceOrigin(ProcessHandle origin) throws IOException {
+        for (String map : List.of("uid_map", "gid_map")) {
+            require(Files.readString(Path.of("/proc/self", map)).strip().replaceAll("\\s+", " ").equals("0 0 4294967295"), "Namespace primer must run in original host UID/GID namespaces");
+        }
+        require(Files.readString(Path.of("/proc/self/status")).lines().anyMatch(line -> line.startsWith("Uid:")
+                && line.substring(4).strip().replaceAll("\\s+", " ").equals("1000 1000 1000 1000")), "Namespace primer must run as UID 1000");
+        require(origin.pid() == ProcessHandle.current().pid()
+                || origin.descendants().anyMatch(process -> process.pid() == ProcessHandle.current().pid()), "Namespace origin must be this process or its live ancestor");
+        var started = origin.info().startInstant();
+        require(origin.isAlive() && started.isPresent(), "Namespace origin is not live");
+        Path process = Path.of("/proc", Long.toString(origin.pid()));
+        require(Files.getOwner(process).equals(Files.getOwner(Path.of("/proc/self"))), "Namespace origin is not owned");
+        String status = Files.readString(process.resolve("status"));
+        require(status.lines().anyMatch(line -> line.startsWith("Uid:")
+                && line.substring(4).strip().replaceAll("\\s+", " ").equals("1000 1000 1000 1000")), "Namespace origin must be owned UID 1000");
+        for (String map : List.of("uid_map", "gid_map")) {
+            require(Files.readString(process.resolve(map)).strip().replaceAll("\\s+", " ").equals("0 0 4294967295"), "Namespace origin requires original host UID/GID maps");
+        }
+        var proof = new Properties();
+        proof.setProperty("originPid", Long.toString(origin.pid()));
+        proof.setProperty("originStarted", started.get().toString());
+        proof.setProperty("originUid", "1000");
+        for (String name : List.of("user", "net")) {
+            Path self = Files.readSymbolicLink(Path.of("/proc/self/ns", name));
+            require(self.equals(Files.readSymbolicLink(process.resolve("ns/" + name))), "Namespace origin must share the primer's original " + name + " namespace");
+            proof.setProperty(name, self.toString());
+        }
+        require(origin.isAlive() && origin.info().startInstant().equals(started), "Namespace origin changed during capture");
+        Path marker = namespaceOriginPath(origin.pid(), started.get());
+        if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
+            privatePeerObject(marker, false, Path.of("/proc", Long.toString(ProcessHandle.current().pid())));
+            require(Files.getPosixFilePermissions(marker).equals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")), "Namespace origin proof must be mode 0600");
+            require(peerProperties(marker).equals(proof), "Existing namespace origin proof differs");
+        } else {
+            Files.createFile(marker, java.nio.file.attribute.PosixFilePermissions.asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")));
+            try (var output = Files.newOutputStream(marker)) { proof.store(output, "Owned original-host namespace identity"); }
+            catch (IOException failed) { Files.deleteIfExists(marker); throw failed; }
+        }
+        return marker;
+    }
+
+    static Properties peerHost(Path run, int port) throws Exception {
+        require(port > 0 && port <= 65535 && run.isAbsolute() && run.normalize().equals(run)
+                && run.getParent().equals(PRISM_ROOT.resolve("isolated-validation"))
+                && run.getFileName().toString().matches("run-[0-9]+"), "Peer host must be a fixed-root live run and valid LAN port");
+        Properties state = peerProperties(run.resolve("run.properties"));
+        require(run.toString().equals(state.getProperty("runDirectory")) && state.getProperty("status", "").equals("running"), "Peer host run is not active");
+        require(PRISM_ROOT.toString().equals(state.getProperty("prismRoot"))
+                && pack("fabulously").instance().equals(state.getProperty("instance")), "Peer host must be the selected original FO profile");
+        Path display = Path.of(state.getProperty("displaySession", ""));
+        require(display.isAbsolute() && display.normalize().equals(display) && !display.equals(peerSession()),
+                "Peer requires a second private hardware display/audio session");
+        privatePeerObject(display, true, peerSession());
+        privatePeerObject(display.resolve("hardware-display.properties"), false, peerSession());
+        var helper = ProcessHandle.of(Long.parseLong(state.getProperty("helperPid", "-1")))
+                .orElseThrow(() -> new IOException("Peer host helper is absent"));
+        require(helper.isAlive() && helper.info().startInstant().orElseThrow().toString().equals(state.getProperty("helperStarted")), "Peer host helper identity changed");
+        Properties displayState = peerProperties(display.resolve("hardware-display.properties"));
+        long controllerPid = Long.parseLong(displayState.getProperty("controllerPid", "-1"));
+        var controller = ProcessHandle.of(controllerPid).orElseThrow(() -> new IOException("Host hardware controller is absent"));
+        require(controller.isAlive() && controller.info().startInstant().orElseThrow().toString().equals(displayState.getProperty("controllerStarted"))
+                && display.toString().equals(displayState.getProperty("workDirectory")), "Host hardware controller identity changed");
+        boolean owned = false;
+        for (var ancestor = helper.parent(); ancestor.isPresent(); ancestor = ancestor.get().parent()) {
+            if (ancestor.get().pid() == controllerPid) { owned = true; break; }
+        }
+        require(owned, "Host hardware controller must own the live FO helper");
+        peerNamespaces(helper);
+        var inodes = new HashSet<String>();
+        for (String table : List.of("tcp", "tcp6")) {
+            for (String line : Files.readAllLines(Path.of("/proc/net", table))) {
+                String[] fields = line.strip().split("\\s+");
+                if (fields.length <= 9 || !fields[3].equals("0A")) continue;
+                String[] local = fields[1].split(":");
+                if (Integer.parseInt(local[1], 16) == port && List.of("00000000", "0100007F", "00000000000000000000000000000000",
+                        "00000000000000000000000001000000", "0000000000000000FFFF00000100007F").contains(local[0])) inodes.add(fields[9]);
+            }
+        }
+        var listeners = new LinkedHashMap<Long, ProcessHandle>();
+        for (var child : helper.descendants().toList()) {
+            if (!child.isAlive() || !child.info().command().orElse("").equals("/usr/lib/jvm/java-21-openjdk/bin/java")) continue;
+            try (var descriptors = Files.list(Path.of("/proc", Long.toString(child.pid()), "fd"))) {
+                for (Path descriptor : descriptors.toList()) {
+                    try {
+                        String link = Files.readSymbolicLink(descriptor).toString();
+                        if (link.startsWith("socket:[") && link.endsWith("]") && inodes.contains(link.substring(8, link.length() - 1))) listeners.put(child.pid(), child);
+                    } catch (IOException vanished) { /* A game thread can close a descriptor. */ }
+                }
+            } catch (IOException exited) { /* A launcher child can exit. */ }
+        }
+        require(listeners.size() == 1, "LAN listener must belong to one live FO game under the host helper");
+        var game = listeners.values().iterator().next();
+        require(game.isAlive(), "Peer host game exited");
+        peerNamespaces(game);
+        state.setProperty("gamePid", Long.toString(game.pid()));
+        state.setProperty("gameStarted", game.info().startInstant().orElseThrow().toString());
+        return state;
+    }
+
+    private static void runPeer(Path original, Path peer, Path hostRun, int port) throws Exception {
+        guardPeerEnvironment();
+        Path session = peerSession();
+        require(peer.isAbsolute() && peer.normalize().equals(peer) && peer.equals(session.resolve("peer-prism")), "Only this session's generated peer root is permitted");
+        privatePeerObject(peer, true, session);
+        Thread shutdown = new Thread(() -> {
+            try { closePeer(peer, session); } catch (IOException failed) { System.err.println("Private peer account cleanup failed"); }
+        }, "private-peer-account-cleanup");
+        Runtime.getRuntime().addShutdownHook(shutdown);
+        try {
+            privatePeerObject(peer.resolve("peer-generation.properties"), false, session);
+            Properties generated = peerProperties(peer.resolve("peer-generation.properties"));
+            Properties hardware = peerProperties(session.resolve("hardware-display.properties"));
+            require(original.toString().equals(generated.getProperty("sourceRoot")) && peer.toString().equals(generated.getProperty("peerRoot"))
+                    && session.toString().equals(generated.getProperty("session")), "Peer generation does not match the fixed source and session");
+            for (String key : List.of("controllerPid", "controllerStarted")) require(hardware.getProperty(key).equals(generated.getProperty(key)), "Peer hardware controller changed");
+            var creator = ProcessHandle.of(Long.parseLong(generated.getProperty("creatorPid", "-1"))).orElseThrow(() -> new IOException("Peer preparation owner is absent"));
+            require(creator.isAlive() && creator.info().startInstant().orElseThrow().toString().equals(generated.getProperty("creatorStarted"))
+                    && (creator.pid() == ProcessHandle.current().pid() || creator.descendants().anyMatch(p -> p.pid() == ProcessHandle.current().pid())), "Peer preparation owner must own the launch helper");
+            Properties host = peerHost(hostRun, port);
+            for (String key : List.of("helperPid", "helperStarted", "gamePid", "gameStarted", "displaySession")) require(host.getProperty(key).equals(generated.getProperty("host." + key)), "Peer live host identity changed");
+            require(hostRun.toString().equals(generated.getProperty("hostRun")) && Integer.toString(port).equals(generated.getProperty("port")), "Peer LAN endpoint changed");
+            Pack pack = pack("fabulously");
+            Path source = original.resolve("instances").resolve(pack.instance()), instance = peer.resolve("instances").resolve(pack.instance());
+            String expectedMods = generated.getProperty("mods.sha256", "");
+            require(expectedMods.equals(peerMods(source.resolve("minecraft/mods"))) && expectedMods.equals(peerMods(instance.resolve("minecraft/mods"))), "Peer mod JAR bytes differ from the selected FO pack");
+            String expectedPack = generated.getProperty("pack.sha256", "");
+            require(expectedPack.equals(peerHash(source.resolve("mmc-pack.json"))) && expectedPack.equals(peerHash(instance.resolve("mmc-pack.json"))), "Peer loader metadata differs from the selected FO pack");
+            String module = hardware.getProperty("relativeInputModule", "");
+            require(module.equals(generated.getProperty("relativeInputModule", ""))
+                    && (module.isEmpty() ? "" : peerHash(Path.of(module))).equals(generated.getProperty("module.sha256", "")), "Peer input module bytes changed");
+            String name = generated.getProperty("peerName", "");
+            require(name.matches("LOPeer[0-9a-f]{8}") && UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8))
+                    .toString().replace("-", "").equals(generated.getProperty("peerUuid")), "Peer offline identity is invalid");
+            privatePeerObject(peer.resolve("accounts.json"), false, session);
+            require(Files.size(peer.resolve("accounts.json")) > 0 && Files.size(peer.resolve("accounts.json")) <= 1024 * 1024, "Peer private account cache is missing or oversized");
+            repairJavaConfig(instance.resolve("instance.cfg"), pack);
+            initializePrismConfig(peer);
+            runPrism(peer, ownedOutput(original), pack, name, port);
+        } finally {
+            closePeer(peer, session);
+            try { Runtime.getRuntime().removeShutdownHook(shutdown); } catch (IllegalStateException exiting) { }
+        }
+    }
+
+    static Process startPeer(ProcessBuilder builder, Map<Long, ProcessHandle> owned) throws IOException {
+        synchronized (PEER_LIFETIME) {
+            require(!peerClosed, "Peer launch is closed");
+            Process process = builder.start();
+            peerProcess = process;
+            peerOwned = owned;
+            return process;
+        }
+    }
+
+    static void closePeer(Path peer, Path session) throws IOException {
+        synchronized (PEER_LIFETIME) {
+            peerClosed = true;
+            if (peerProcess != null) {
+                cleanup(peerProcess, peerOwned);
+                try {
+                    require(peerProcess.waitFor(2, TimeUnit.SECONDS), "Peer launcher did not stop; private account copy retained");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while stopping peer launcher; private account copy retained");
+                }
+            }
+            deletePeerAccounts(peer, session);
+        }
+    }
+
+    static void deletePeerAccounts(Path peer, Path session) throws IOException {
+        try (var entries = Files.newDirectoryStream(peer)) {
+            for (Path accounts : entries) {
+                String name = accounts.getFileName().toString();
+                if (name.equals("accounts.json") || name.startsWith("accounts.json.") || name.startsWith(".accounts.json.")) {
+                    privatePeerObject(accounts, false, session);
+                    Files.delete(accounts);
+                }
+            }
+        }
     }
 
     private static void guardDisplay(boolean displayCheck) throws Exception {
@@ -444,6 +785,11 @@ class RunFabricPackIsolated {
         state.setProperty("screenWidth", Integer.toString(screen.width));
         state.setProperty("screenHeight", Integer.toString(screen.height));
         state.setProperty("status", status);
+        if (activePrismRoot != null) {
+            state.setProperty("prismRoot", activePrismRoot.toString());
+            state.setProperty("instance", activeInstance);
+            state.setProperty("displaySession", Path.of(System.getenv("XAUTHORITY")).getParent().toString());
+        }
         Path target = output.resolve("run.properties");
         rejectSymlinks(target);
         Path temporary = Files.createTempFile(output, ".run-state-", ".tmp");
@@ -583,15 +929,23 @@ class RunFabricPackIsolated {
     }
 
     private static void runPrism(Path root, Path output, Pack pack) throws Exception {
+        runPrism(root, output, pack, null, 0);
+    }
+
+    private static void runPrism(Path root, Path output, Pack pack, String peerName, int port) throws Exception {
+        activePrismRoot = root;
+        activeInstance = pack.instance();
         Path log = output.resolve("prism.log");
         Robot capture = new Robot();
         capture.setAutoDelay(50);
         capture.setAutoWaitForIdle(true);
         Rectangle screen = new Rectangle(java.awt.Toolkit.getDefaultToolkit().getScreenSize());
         Path screenshot = output.resolve("screen-latest.png");
+        var command = new ArrayList<>(List.of("/usr/bin/prismlauncher", "--dir", root.toString(), "--launch", pack.instance()));
+        if (peerName != null) command.addAll(List.of("--profile", peerName, "--server", "127.0.0.1:" + port));
         // Let Prism offer the cached name: overriding only its name retains the account UUID.
-        var builder = new ProcessBuilder("/usr/bin/prismlauncher", "--dir", root.toString(),
-                "--launch", pack.instance(), "--offline", "");
+        command.addAll(List.of("--offline", peerName == null ? "" : peerName));
+        var builder = new ProcessBuilder(command);
         builder.directory(root.toFile());
         builder.environment().put("QT_QPA_PLATFORM", "xcb");
         for (String key : List.of("XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME")) {
@@ -599,8 +953,8 @@ class RunFabricPackIsolated {
         }
         builder.redirectErrorStream(true).redirectOutput(log.toFile());
         launchNanos = System.nanoTime();
-        Process process = builder.start();
         var owned = new LinkedHashMap<Long, ProcessHandle>();
+        Process process = peerName == null ? builder.start() : startPeer(builder, owned);
         Thread shutdown = new Thread(() -> cleanup(process, owned), "private-prism-cleanup");
         Runtime.getRuntime().addShutdownHook(shutdown);
         try {
