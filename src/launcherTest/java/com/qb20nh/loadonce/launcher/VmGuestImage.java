@@ -38,6 +38,17 @@ public final class VmGuestImage {
     }
 
     public static Build create(Path workRoot, Path spec, Path xvfb) throws Exception {
+        return create(workRoot, spec, xvfb, JAVA_HOME, false);
+    }
+
+    public static Build createOpaque(Path workRoot, Path spec, Path xvfb) throws Exception {
+        Properties properties = opaqueSpecification(spec);
+        Path javaHome = opaquePath(properties, "java.home");
+        requireFile(javaHome.resolve("bin/java"));
+        return create(workRoot, spec, xvfb, javaHome, true);
+    }
+
+    private static Build create(Path workRoot, Path spec, Path xvfb, Path javaHome, boolean opaque) throws Exception {
         if ((spec == null) != (xvfb == null)) {
             throw new IOException("Minecraft guest requires both a launch specification and local Xvfb");
         }
@@ -45,29 +56,29 @@ public final class VmGuestImage {
             throw new IOException("VM guest image construction requires the local Linux resources");
         }
         Path directory = LauncherFiles.tempDirectory(workRoot, "guest-image-");
-        Stage root = new Stage(LauncherFiles.privateDirectory(directory.resolve("root")), directory);
-        Stage ramdisk = new Stage(LauncherFiles.privateDirectory(directory.resolve("ramdisk")), directory);
+        Stage root = new Stage(LauncherFiles.privateDirectory(directory.resolve("root")), directory, javaHome);
+        Stage ramdisk = new Stage(LauncherFiles.privateDirectory(directory.resolve("ramdisk")), directory, javaHome);
         Path kernelSource = Path.of("/boot/vmlinuz-linux-cachyos-lts");
         Path module = Path.of("/usr/lib/modules", KERNEL_VERSION, "kernel/fs/squashfs/squashfs.ko.zst");
         requireFile(kernelSource);
         requireFile(module);
-        root.copy(JAVA_HOME.resolve("bin"));
-        root.copy(JAVA_HOME.resolve("lib"));
-        root.copy(JAVA_HOME.resolve("conf"));
-        root.copy(JAVA_HOME.resolve("release"));
+        root.copy(javaHome.resolve("bin"));
+        root.copy(javaHome.resolve("lib"));
+        root.copy(javaHome.resolve("conf"));
+        root.copy(javaHome.resolve("release"));
         root.copy(Path.of("/usr/lib/locale/C.utf8"));
         root.file(BUSYBOX, root.guest(Path.of("/usr/bin/busybox")));
         ramdisk.file(BUSYBOX, ramdisk.guest(Path.of("/usr/bin/busybox")));
 
         Set<Path> elf = new LinkedHashSet<>();
-        elf.add(JAVA_HOME.resolve("bin/java"));
+        elf.add(javaHome.resolve("bin/java"));
         elf.add(BUSYBOX);
         for (String command : List.of("mount", "date", "stty")) {
             Path executable = Path.of("/usr/bin", command);
             root.copy(executable);
             elf.add(executable);
         }
-        try (var paths = Files.walk(JAVA_HOME.resolve("lib"))) {
+        try (var paths = Files.walk(javaHome.resolve("lib"))) {
             paths.filter(path -> path.getFileName().toString().endsWith(".so") && Files.isRegularFile(path))
                     .forEach(elf::add);
         }
@@ -80,7 +91,7 @@ public final class VmGuestImage {
         }
         ramdisk.dependencies(bootElf);
         root.copyClasses(OpaqueStateFixture.class);
-        String init = spec == null ? guestInit() : minecraft(root, spec, xvfb);
+        String init = opaque ? opaque(root, spec, xvfb, javaHome) : spec == null ? guestInit() : minecraft(root, spec, xvfb);
         for (String name : List.of("dev", "proc", "sys", "tmp", "run", "prototype")) {
             LauncherFiles.privateDirectory(root.root.resolve(name));
         }
@@ -207,6 +218,18 @@ public final class VmGuestImage {
         try (var output = Files.newOutputStream(launch)) {
             spec.store(output, "Pinned local Minecraft VM launch");
         }
+        graphics(root, xvfb);
+        List<String> command = new ArrayList<>(List.of(JAVA_HOME.resolve("bin/java").toString(), "-Xshare:off",
+                "-XX:+PerfDisableSharedMem", "-XX:+DisableAttachMechanism"));
+        command.addAll(jvm);
+        command.addAll(List.of("-Xms64m", "-Xmx1536m", "-Duser.home=/prototype/home", "-Djnidispatch.preserve=true",
+                "-Djava.io.tmpdir=/prototype/tmp", "-Dloadonce.prototype.opaqueDirectory=/prototype",
+                "-cp", String.join(":", classpath), MinecraftPrototypeBootstrap.class.getName(),
+                "--cold", "--control-file", "/prototype/launch.properties"));
+        return minecraftInit(game, command);
+    }
+
+    private static void graphics(Stage root, Path xvfb) throws Exception {
         requireFile(xvfb);
         root.file(xvfb, root.root.resolve("usr/bin/Xvfb"));
         Set<Path> graphics = new LinkedHashSet<>(Set.of(xvfb));
@@ -216,7 +239,7 @@ public final class VmGuestImage {
         for (String library : List.of("libvulkan.so.1", "libvulkan_lvp.so", "libGL.so.1", "libGLX_mesa.so.0",
                 "libEGL_mesa.so.0", "dri/swrast_dri.so", "libX11.so.6", "libXext.so.6", "libXcursor.so.1",
                 "libXi.so.6", "libXrandr.so.2", "libXfixes.so.3", "libXrender.so.1", "libXss.so.1",
-                "libxkbcommon.so.0", "libxkbcommon-x11.so.0", "libudev.so.1")) {
+                "libxkbcommon.so.0", "libxkbcommon-x11.so.0", "libudev.so.1", "libfontconfig.so.1")) {
             Path resource = Path.of("/usr/lib", library);
             root.copy(resource);
             graphics.add(resource);
@@ -235,14 +258,186 @@ public final class VmGuestImage {
         write(root.root.resolve("etc/passwd"), "root:x:0:0:root:/prototype/home:/bin/sh\n", false);
         write(root.root.resolve("etc/group"), "root:x:0:\n", false);
         write(root.root.resolve("etc/hosts"), "127.0.0.1 localhost\n::1 localhost\n", false);
-        List<String> command = new ArrayList<>(List.of(JAVA_HOME.resolve("bin/java").toString(), "-Xshare:off",
-                "-XX:+PerfDisableSharedMem", "-XX:+DisableAttachMechanism"));
-        command.addAll(jvm);
-        command.addAll(List.of("-Xms64m", "-Xmx1536m", "-Duser.home=/prototype/home", "-Djnidispatch.preserve=true",
-                "-Djava.io.tmpdir=/prototype/tmp", "-Dloadonce.prototype.opaqueDirectory=/prototype",
-                "-cp", String.join(":", classpath), MinecraftPrototypeBootstrap.class.getName(),
-                "--cold", "--control-file", "/prototype/launch.properties"));
-        return minecraftInit(game, command);
+    }
+
+    private static Properties opaqueSpecification(Path specification) throws IOException {
+        requireFile(specification);
+        LauncherFiles.checkPrivate(specification, false);
+        if (Files.size(specification) > 1024 * 1024) throw new IOException("Opaque guest specification exceeds 1 MiB");
+        Properties spec = new Properties();
+        try (var input = Files.newInputStream(specification)) { spec.load(input); }
+        Path game = opaquePath(spec, "game.directory");
+        LauncherFiles.checkPrivate(game, true);
+        if (!List.of("1536", "2304").contains(required(spec, "memory.mib"))) {
+            throw new IOException("Opaque guest prototype requires memory.mib=1536 or 2304");
+        }
+        long bytes = 0;
+        try (var files = Files.walk(game)) {
+            for (Path file : files.toList()) {
+                if (Files.isSymbolicLink(file)) throw new IOException("Opaque guest game contains a symlink: " + file);
+                if (Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+                    bytes += Files.size(file);
+                    if (bytes > 512L * 1024 * 1024) {
+                        throw new IOException("Opaque guest game exceeds 512 MiB tmpfs budget: " + game
+                                + "; larger packs require disk-backed writable game storage");
+                    }
+                } else if (!Files.isDirectory(file, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Opaque guest game entry is not a regular file or directory: " + file);
+                }
+            }
+        }
+        for (String key : List.of("assets.directory", "native.directory", "java.home")) {
+            Path path = opaquePath(spec, key);
+            if (!Files.isDirectory(path) || path.startsWith(game) || game.startsWith(path)) {
+                throw new IOException("Opaque guest " + key + " must be a directory outside game.directory: " + path);
+            }
+        }
+        String main = required(spec, "main.class");
+        if (!main.matches("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*")) {
+            throw new IOException("Invalid opaque guest Java entrypoint: " + main);
+        }
+        List<String> classpath = indexed(spec, "classpath");
+        if (classpath.isEmpty()) throw new IOException("Opaque guest classpath is empty");
+        for (int index = 0; index < classpath.size(); index++) {
+            String entry = classpath.get(index);
+            Path path = opaqueStagingPath(entry, "classpath." + index);
+            if (entry.contains(":")) throw new IOException("Invalid opaque guest classpath." + index + ": " + entry);
+            requireFile(path);
+        }
+        opaqueArguments(spec);
+        return spec;
+    }
+
+    private static Path opaquePath(Properties spec, String key) throws IOException {
+        return opaqueStagingPath(required(spec, key), key);
+    }
+
+    static Path opaqueStagingPath(String value, String field) throws IOException {
+        Path path = Path.of(value);
+        if (!path.isAbsolute()) throw new IOException("Opaque guest path must be absolute: " + field + "=" + path);
+        path = path.normalize();
+        boolean hidden = path.startsWith("/run") && !path.startsWith("/run/media");
+        for (String mount : List.of("/tmp", "/prototype", "/dev", "/proc", "/sys")) hidden |= path.startsWith(mount);
+        if (hidden) throw new IOException("Opaque guest staging input is hidden by a runtime mount: " + field + "=" + path
+                + "; choose a path under /home or /run/media");
+        return path;
+    }
+
+    private static List<String> opaqueArguments(Properties spec) throws IOException {
+        int count;
+        try { count = Integer.parseInt(required(spec, "arguments.count")); }
+        catch (NumberFormatException failure) { throw new IOException("Invalid opaque guest arguments.count", failure); }
+        if (count < 0 || count > 4096) throw new IOException("Opaque guest arguments.count exceeds 4096");
+        List<String> arguments = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            String argument = spec.getProperty("arguments." + index);
+            if (argument == null || argument.indexOf('\0') >= 0) throw new IOException("Invalid opaque guest argument " + index);
+            arguments.add(argument);
+        }
+        return arguments;
+    }
+
+    private static String opaque(Stage root, Path specification, Path xvfb, Path javaHome) throws Exception {
+        Properties spec = opaqueSpecification(specification);
+        if (!javaHome.equals(opaquePath(spec, "java.home"))) throw new IOException("Opaque guest runtime changed during staging");
+        root.sources.put(specification.toRealPath(), LauncherFiles.fileHash(specification));
+        Path copiedSpec = root.evidence.resolve("opaque-spec.properties");
+        Files.copy(specification, copiedSpec);
+        Files.setPosixFilePermissions(copiedSpec, PosixFilePermissions.fromString("rw-------"));
+        Path game = opaquePath(spec, "game.directory");
+        root.copy(game);
+        root.copy(opaquePath(spec, "assets.directory"));
+        Path natives = opaquePath(spec, "native.directory");
+        root.copy(natives);
+        Set<Path> archives = new LinkedHashSet<>();
+        List<String> classpath = indexed(spec, "classpath");
+        for (String entry : classpath) {
+            Path file = Path.of(entry);
+            root.copy(file);
+            if (entry.endsWith(".jar")) archives.add(file);
+        }
+        Set<Path> nativeFiles = new LinkedHashSet<>();
+        try (var files = Files.walk(natives)) {
+            files.filter(file -> Files.isRegularFile(file) && file.getFileName().toString().matches(".*\\.so(?:\\..*)?"))
+                    .forEach(nativeFiles::add);
+        }
+        root.dependencies(nativeFiles);
+        try (var files = Files.walk(game)) {
+            files.filter(file -> Files.isRegularFile(file) && file.getFileName().toString().endsWith(".jar"))
+                    .forEach(archives::add);
+        }
+        root.nativeDependencies(archives);
+        graphics(root, xvfb);
+        root.copyClasses(OpaqueGuestControl.class);
+        write(root.root.resolve("app/.loadonce-opaque-guest"), "LoadOnce opaque guest\n", false);
+        LauncherFiles.privateDirectory(root.root.resolve("app/game-template"));
+        List<String> command = new ArrayList<>(List.of(javaHome.resolve("bin/java").toString(),
+                "-Xms256m", "-Xmx" + required(spec, "memory.mib") + "m", "-Djava.library.path=" + natives,
+                "-Duser.home=/prototype/home", "-Djava.io.tmpdir=/tmp", "-cp", String.join(":", classpath),
+                required(spec, "main.class")));
+        command.addAll(opaqueArguments(spec));
+        return opaqueInit(game, javaHome, command);
+    }
+
+    private static String opaqueInit(Path game, Path javaHome, List<String> command) {
+        return """
+                #!/bin/sh
+                export PATH=/bin:/usr/bin
+                umask 077
+                exec </dev/ttyS0 >/dev/ttyS0 2>&1
+                stty -echo -ixon -ixoff
+                finish() {
+                    busybox poweroff -f
+                    while :; do busybox sleep 1; done
+                }
+                failed() {
+                    [ ! -f /tmp/loadonce-game.log ] || busybox cat /tmp/loadonce-game.log
+                    [ ! -f /prototype/display.log ] || busybox cat /prototype/display.log
+                    printf 'VM_FAILED step=%%s\\n' "$1"
+                    finish
+                }
+                mount -n -t tmpfs -o mode=0700 tmpfs /prototype || failed work-mount
+                mount -n -t tmpfs -o mode=1777,size=384m tmpfs /tmp || failed tmp-mount
+                printf 'localhost\\n' >/proc/sys/kernel/hostname || failed guest-hostname
+                game=%s
+                mount -n --bind "$game" /app/game-template || failed game-template-bind
+                mount -n -t tmpfs -o mode=0700,size=768m tmpfs "$game" || failed game-mount
+                busybox cp -R /app/game-template/. "$game/" || failed game-template
+                busybox mkdir -p /prototype/home /prototype/xdg /prototype/mesa-cache || failed work-directories
+                export HOME=/prototype/home TMPDIR=/tmp XDG_RUNTIME_DIR=/prototype/xdg
+                export MESA_SHADER_CACHE_DIR=/prototype/mesa-cache DISPLAY=:117
+                export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe __GLX_VENDOR_LIBRARY_NAME=mesa
+                export LIBGL_DRIVERS_PATH=/usr/lib/dri SDL_VIDEODRIVER=x11 ALSOFT_DRIVERS=null
+                export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+                export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+                export LANG=C.UTF-8
+                /usr/bin/Xvfb :117 -screen 0 1280x720x24 -nolisten tcp -ac -noreset -fp built-ins \
+                    -ardelay 60000 -arinterval 60000 \
+                    >/prototype/display.log 2>&1 &
+                display=$!
+                attempts=0
+                while [ ! -S /tmp/.X11-unix/X117 ]; do
+                    kill -0 "$display" 2>/dev/null || failed display-before-ready
+                    attempts=$((attempts + 1))
+                    [ "$attempts" -lt 400 ] || failed display-timeout
+                    busybox sleep 0.05
+                done
+                cd "$game" || failed game-directory
+                %s </dev/null >/tmp/loadonce-game.log 2>&1 &
+                app=$!
+                stty -F /dev/ttyS1 -echo -ixon -ixoff || failed control-terminal
+                %s/bin/java -Xms32m -Xmx128m -cp /app/classes \
+                    com.qb20nh.loadonce.launcher.OpaqueGuestControl "$app" /tmp/loadonce-game.log \
+                    </dev/ttyS1 >/dev/ttyS1 2>&1 || failed control-exit
+                kill -0 "$app" 2>/dev/null && failed application-still-running
+                wait "$app"
+                appExit=$?
+                printf 'OPAQUE_APPLICATION_EXIT code=%%s\\n' "$appExit"
+                kill "$display" 2>/dev/null
+                finish
+                """.formatted(quote(game.toString()), command.stream().map(VmGuestImage::quote)
+                .collect(java.util.stream.Collectors.joining(" ")), quote(javaHome.toString()));
     }
 
     private static String required(Properties properties, String field) throws IOException {
@@ -368,6 +563,11 @@ public final class VmGuestImage {
                 mount -n -t tmpfs -o mode=0755 tmpfs /run
                 insmod /squashfs.ko
                 mount -n -t squashfs -o ro /dev/vda /newroot
+                # Preserve staged removable-volume files beneath the writable runtime mount.
+                if [ -d /newroot/run/media ]; then
+                    busybox mkdir -p /run/media
+                    mount -n --bind /newroot/run/media /run/media
+                fi
                 mount -n --move /dev /newroot/dev
                 mount -n --move /proc /newroot/proc
                 mount -n --move /sys /newroot/sys
@@ -455,12 +655,14 @@ public final class VmGuestImage {
     private static final class Stage {
         private final Path root;
         private final Path evidence;
+        private final Path javaHome;
         private final Set<Path> copied = new LinkedHashSet<>();
         private final Map<Path, String> sources = new LinkedHashMap<>();
 
-        private Stage(Path root, Path evidence) throws IOException {
+        private Stage(Path root, Path evidence, Path javaHome) throws IOException {
             this.root = root;
             this.evidence = evidence;
+            this.javaHome = javaHome;
             LauncherFiles.privateDirectory(root.resolve("usr/bin"));
             LauncherFiles.privateDirectory(root.resolve("usr/lib"));
             Files.createSymbolicLink(root.resolve("bin"), Path.of("usr/bin"));
@@ -529,8 +731,8 @@ public final class VmGuestImage {
             Map<String, String> environment = new LinkedHashMap<>(ENVIRONMENT);
             // Standalone ldd must resolve libraries normally loaded by the Java launcher.
             Set<String> libraryDirectories = new LinkedHashSet<>();
-            libraryDirectories.add(JAVA_HOME.resolve("lib").toString());
-            libraryDirectories.add(JAVA_HOME.resolve("lib/server").toString());
+            libraryDirectories.add(javaHome.resolve("lib").toString());
+            libraryDirectories.add(javaHome.resolve("lib/server").toString());
             environment.put("LD_LIBRARY_PATH", String.join(":", libraryDirectories));
             for (int index = 0; index < pending.size(); index++) {
                 Path binary = pending.get(index).toRealPath();

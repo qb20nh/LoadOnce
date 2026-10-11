@@ -3,6 +3,7 @@ package com.qb20nh.loadonce.launcher;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
@@ -25,6 +26,10 @@ public final class LauncherFilesTest {
     public static void main(String[] args) throws Exception {
         Path root = LauncherFiles.tempDirectory(null, "loadonce-files-contract-");
         try {
+            vmSnapshotCopies(root);
+            opaqueVmAcceptanceMarkers();
+            opaqueVmStagingPaths();
+            opaqueVmInputCommands();
             Path file = LauncherFiles.tempFile(root, "payload-", ".bin");
             Files.writeString(file, "version1");
             LauncherFiles.checkPrivate(file, false);
@@ -167,6 +172,93 @@ public final class LauncherFilesTest {
         } finally {
             LauncherFiles.deleteTree(root);
         }
+    }
+
+    private static void vmSnapshotCopies(Path root) throws Exception {
+        Path source = LauncherFiles.tempFile(root, "snapshot-", ".qcow2");
+        Files.writeString(source, "qcow2 header and internal snapshot bytes\n");
+        Path copy = root.resolve("snapshot-copy.qcow2");
+        Map<String, String> environment = Map.of("PATH", "/usr/bin:/bin", "LANG", "C");
+        VmStateSmoke.cloneSnapshot(source, copy, 3, environment);
+        check(Files.mismatch(source, copy) == -1, "VM snapshot clone changed source bytes");
+        Files.writeString(copy, "changed restored state");
+        check(Files.readString(source).equals("qcow2 header and internal snapshot bytes\n"), "VM clone shares writable source state");
+        fails(() -> VmStateSmoke.cloneSnapshot(source, copy, 3, environment), "existing VM clone destination overwritten");
+        check(Files.readString(copy).equals("changed restored state"), "existing VM clone destination changed");
+        if (Files.exists(root.resolve(copy.getFileName() + "-copy.log"))) {
+            Path large = LauncherFiles.tempFile(root, "large-snapshot-", ".qcow2");
+            try (var output = Files.newByteChannel(large, StandardOpenOption.WRITE)) {
+                output.position(Files.getFileStore(root).getUsableSpace() + 1);
+                output.write(java.nio.ByteBuffer.wrap(new byte[] { 1 }));
+            }
+            Path refused = root.resolve("refused-snapshot.qcow2");
+            try {
+                VmStateSmoke.cloneSnapshot(large, refused, 3, environment);
+                throw new AssertionError("VM snapshot fallback ignored insufficient space");
+            } catch (IOException expected) {
+                check(expected.getMessage().contains("allocated_bytes=") && expected.getMessage().contains("remaining_copies=3")
+                        && expected.getMessage().contains("available_bytes="), "VM clone space failure lacks recovery evidence");
+            }
+            check(!Files.exists(refused), "VM clone space failure left a partial destination");
+        }
+    }
+
+    private static void opaqueVmAcceptanceMarkers() {
+        String marker = "LOColdVerified";
+        String confirmation = "[12:34:56] [Server thread/INFO]: [LoadOnceTest] " + marker;
+        check(VmOpaqueSmoke.successfulMarker("Earlier log line\n" + confirmation + "\nLater log line\n", marker),
+                "successful opaque cold world confirmation rejected");
+        check(VmOpaqueSmoke.successfulMarker("[12:34:56] [Server thread/INFO]: [LoadOnceTest] LOWarmVerified2\r\n",
+                "LOWarmVerified2"), "successful opaque warm world confirmation rejected");
+        for (String invalid : List.of(
+                "[12:34:56] [Render thread/INFO]: [CHAT] [LoadOnceTest] " + marker,
+                "[12:34:56] [Server thread/INFO]: Unknown or incomplete command: execute say " + marker,
+                "[12:34:56] [Server thread/INFO]: <LoadOnceTest> /say " + marker,
+                confirmation + "Extra",
+                confirmation + " extra",
+                confirmation.replace("LOColdVerified", "BeforeLOColdVerified"),
+                confirmation.replace("Server thread", "Render thread"),
+                confirmation.replace("Server thread/INFO", "Server thread/ERROR"),
+                "prefix " + confirmation,
+                "[12:34:56] [Server thread/INFO]: [LoadOnceTest] LOWarmVerified3")) {
+            check(!VmOpaqueSmoke.successfulMarker(invalid, marker), "opaque world confirmation accepted false evidence: " + invalid);
+        }
+        check(!VmOpaqueSmoke.successfulMarker("[12:34:56] [Server thread/INFO]: [LoadOnceTest] LOWarmVerified3",
+                "LOWarmVerified2"), "opaque warm world confirmation accepted another restore cycle");
+    }
+
+    private static void opaqueVmInputCommands() throws Exception {
+        VmOpaqueSmoke.validateCommands(List.of("TEXT /", "KEY BACKSPACE", "TEXT /say LOColdVerified", "KEY ENTER"));
+        VmOpaqueSmoke.validateCommands(List.of("SCREEN", "MENU_READY", "STATE"));
+        fails(() -> VmOpaqueSmoke.validateCommands(List.of("MENU_READY", "MENU_READY")), "duplicate menu observation accepted");
+        fails(() -> VmOpaqueSmoke.validateCommands(List.of("KEY CTRL_A")), "unsupported key chord accepted");
+        fails(() -> VmOpaqueSmoke.validateCommands(List.of("TEXT " + "a".repeat(161))), "oversized typing command accepted");
+        fails(() -> VmOpaqueSmoke.validateCommands(java.util.Collections.nCopies(17, "SCREEN")), "oversized input batch accepted");
+    }
+
+    private static void opaqueVmStagingPaths() throws Exception {
+        if (!"Linux".equals(System.getProperty("os.name"))) return;
+        for (String value : List.of("/home/loadonce/game", "/run/media/loadonce/volume/assets", "/run/media",
+                "/usr/lib/jvm/java-17-openjdk", "/tmp-files/library.jar", "/home/loadonce/game/../assets")) {
+            check(VmGuestImage.opaqueStagingPath(value, "game.directory").equals(Path.of(value).normalize()),
+                    "visible opaque staging path rejected or changed: " + value);
+        }
+        for (String value : List.of("/tmp/game", "/prototype/assets", "/dev/natives", "/proc/java", "/sys/library.jar",
+                "/run/game", "/run", "/run/media-other/library.jar", "/run/media/../game", "/home/../tmp/game")) {
+            for (String field : List.of("game.directory", "assets.directory", "native.directory", "java.home", "classpath.0")) {
+                try {
+                    VmGuestImage.opaqueStagingPath(value, field);
+                    throw new AssertionError("hidden opaque staging input accepted: " + field + "=" + value);
+                } catch (IOException expected) {
+                    check(expected.getMessage().contains(field + "=" + Path.of(value).normalize())
+                            && expected.getMessage().contains("hidden by a runtime mount")
+                            && expected.getMessage().contains("/home or /run/media"),
+                            "opaque staging path failure lacks field, path or recovery: " + field + "=" + value);
+                }
+            }
+        }
+        fails(() -> VmGuestImage.opaqueStagingPath("relative/library.jar", "classpath.0"),
+                "relative opaque staging classpath accepted");
     }
 
     private static List<String> child(String... args) {

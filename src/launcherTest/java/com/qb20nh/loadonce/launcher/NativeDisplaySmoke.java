@@ -72,8 +72,9 @@ public final class NativeDisplaySmoke {
 
                 Path displayOutput = LauncherFiles.tempFile(session.directory, "display-", ".txt");
                 Path displayError = LauncherFiles.tempFile(session.directory, "Xvfb-", ".log");
-                session.startDisplay(List.of(xvfb.toString(), "-displayfd", "1", "-screen", "0", "640x480x24",
-                        "-nolisten", "tcp", "-auth", authority.toString(), "-noreset"),
+                session.startDisplay(List.of(xvfb.toString(), "-displayfd", "1", "-screen", "0", "1280x720x24",
+                        "-nolisten", "tcp", "-auth", authority.toString(), "-noreset",
+                        "-ardelay", "60000", "-arinterval", "60000"),
                         cwd, environment, displayOutput, displayError);
                 String display = waitForDisplay(session.display, displayOutput, displayError);
                 authorize(session, xauth, authority, display, cookie, environment, cwd);

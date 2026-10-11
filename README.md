@@ -200,6 +200,8 @@ See [validation and continuation notes](docs/prototype-status.md) for recorded h
 
 The stronger continuation experiment retains initialized application objects, mod threads and native resources across independent restores. Optional external-CRIU and whole-KVM-guest harnesses exercise that boundary without CRaC callbacks or rerunning application initialization. See [initialized-state evidence, commands and limits](docs/transparent-state-prototype.md). The installed external-launcher wrapper still uses its documented AOT and ordinary-startup policy.
 
+For the Fabulously Optimized and Spectral Creation profiles, see [Fabric modpack setup and acceptance checks](docs/large-fabric-modpack-testing.md). The guide covers private display tests and the experimental unmodified-application VM controller. Installing a pack is separate from proving cold world loading and warm restoration.
+
 ## License
 
 CC0-1.0, inherited from the Fabric template.

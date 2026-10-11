@@ -8,7 +8,9 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,7 +22,8 @@ import java.util.concurrent.TimeUnit;
 /** Independent whole-guest snapshots, including its kernel and native resources. */
 public final class VmStateSmoke {
     private static final Duration TIMEOUT = Duration.ofMinutes(10);
-    private static final String SNAPSHOT = "loadonce-initialized";
+    static final String SNAPSHOT = "loadonce-initialized";
+    private static final int RESTORE_CYCLES = 3;
 
     private VmStateSmoke() { }
 
@@ -75,11 +78,9 @@ public final class VmStateSmoke {
         store(directory.resolve("ready.properties"), ready);
         String witnessKey = minecraft ? "probe.probe_identity" : "heap_witness";
         System.out.println("VM_STATE captured witness=" + ready.getProperty(witnessKey) + " workspace=" + directory);
-        for (int cycle = 1; cycle <= 3; cycle++) {
+        for (int cycle = 1; cycle <= RESTORE_CYCLES; cycle++) {
             Path copy = directory.resolve("restore-" + cycle + ".qcow2");
-            ChildProcess.Result cloned = ChildProcess.run(List.of("/usr/bin/cp", "--reflink=always", "--", state.toString(), copy.toString()),
-                    directory, environment(qemu), directory.resolve("clone-" + cycle + ".log"), Duration.ofSeconds(30));
-            require(cloned.exitCode() == 0, "VM restore requires a private reflink; inspect " + directory.resolve("clone-" + cycle + ".log"));
+            cloneSnapshot(state, copy, RESTORE_CYCLES - cycle + 1, environment(qemu));
             Thread.sleep(2100);
             try (Session restored = Session.start(qemu, image, copy, "restore-" + cycle, true, minecraft)) {
                 restored.qmp.command("cont", null);
@@ -94,9 +95,52 @@ public final class VmStateSmoke {
         Properties completion = new Properties();
         completion.setProperty("status", "passed");
         completion.setProperty("target", minecraft ? "minecraft" : "cpu");
-        completion.setProperty("restore_cycles", "3");
+        completion.setProperty("restore_cycles", Integer.toString(RESTORE_CYCLES));
         store(directory.resolve("completion.properties"), completion);
         System.out.println("VM_STATE PASSED workspace=" + directory);
+    }
+
+    static void cloneSnapshot(Path state, Path copy, int remainingCopies, Map<String, String> environment) throws Exception {
+        Path directory = copy.getParent();
+        require(!Files.exists(copy, LinkOption.NOFOLLOW_LINKS), "VM clone destination already exists: " + copy);
+        Path log = directory.resolve(copy.getFileName() + "-clone.log");
+        Files.createFile(copy, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+        try {
+            ChildProcess.Result reflink = ChildProcess.run(List.of("/usr/bin/cp", "--reflink=always", "--",
+                    state.toString(), copy.toString()), directory, environment, log, TIMEOUT);
+            if (reflink.exitCode() == 0) return;
+            Files.delete(copy);
+            Path allocationLog = directory.resolve(copy.getFileName() + "-allocation.log");
+            ChildProcess.Result allocation = ChildProcess.run(List.of("/usr/bin/stat", "--format=%b %B", "--", state.toString()),
+                    directory, environment, allocationLog, Duration.ofSeconds(30));
+            require(allocation.exitCode() == 0, "Cannot measure VM snapshot allocation: " + state + "; inspect " + allocationLog);
+            long allocated;
+            long required;
+            long logical = Files.size(state);
+            try {
+                String[] fields = allocation.output().trim().split("\\s+");
+                allocated = Math.multiplyExact(Long.parseLong(fields[0]), Long.parseLong(fields[1]));
+                // Reserve full copies even when sparse copying is unavailable on the destination filesystem.
+                required = Math.multiplyExact(Math.addExact(Math.max(logical, allocated), 1024 * 1024), remainingCopies);
+            } catch (ArithmeticException | NumberFormatException | ArrayIndexOutOfBoundsException invalid) {
+                throw new IOException("Invalid VM snapshot allocation: " + state + "; inspect " + allocationLog, invalid);
+            }
+            long available = Files.getFileStore(directory).getUsableSpace();
+            require(available >= required, "VM snapshot fallback lacks space: source=" + state + " destination=" + copy
+                    + " allocated_bytes=" + allocated + " logical_bytes=" + logical + " remaining_copies=" + remainingCopies
+                    + " required_bytes=" + required + " available_bytes=" + available
+                    + "; use storage with enough free space or reflink support; inspect " + log);
+            Files.createFile(copy, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+            Path fallbackLog = directory.resolve(copy.getFileName() + "-copy.log");
+            ChildProcess.Result copied = ChildProcess.run(List.of("/usr/bin/cp", "--reflink=never", "--sparse=always", "--",
+                    state.toString(), copy.toString()), directory, environment, fallbackLog, TIMEOUT);
+            require(copied.exitCode() == 0, "VM snapshot copy failed: source=" + state + " destination=" + copy
+                    + "; inspect " + fallbackLog);
+        } catch (Exception failure) {
+            try { Files.deleteIfExists(copy); }
+            catch (IOException cleanupFailure) { failure.addSuppressed(cleanupFailure); }
+            throw failure;
+        }
     }
 
     private static void validate(Properties ready, Properties result, int cycle, boolean minecraft) throws IOException {
@@ -142,7 +186,7 @@ public final class VmStateSmoke {
         catch (RuntimeException invalid) { throw new IOException("VM evidence needs a numeric " + key, invalid); }
     }
 
-    private static Map<String, String> environment(Path qemu) {
+    static Map<String, String> environment(Path qemu) {
         return Map.of("PATH", "/usr/bin:/bin", "LANG", "C.UTF-8",
                 "LD_LIBRARY_PATH", qemu.resolve("usr/lib").toString(),
                 "QEMU_MODULE_DIR", qemu.resolve("usr/lib/qemu").toString());
@@ -154,27 +198,40 @@ public final class VmStateSmoke {
         try (var output = Files.newOutputStream(file)) { properties.store(output, "Whole guest state evidence"); }
     }
 
-    private static final class Session implements AutoCloseable {
+    static final class Session implements AutoCloseable {
         final Process process;
         final LinePipe serial;
+        final LinePipe control;
         final Qmp qmp;
         final Path log;
+        final long startedNanos;
         final Thread shutdown;
 
-        private Session(Process process, LinePipe serial, Qmp qmp, Path log) {
-            this.process = process; this.serial = serial; this.qmp = qmp; this.log = log;
+        private Session(Process process, LinePipe serial, LinePipe control, Qmp qmp, Path log, long startedNanos) {
+            this.process = process; this.serial = serial; this.control = control; this.qmp = qmp; this.log = log;
+            this.startedNanos = startedNanos;
             shutdown = new Thread(process::destroyForcibly, "LoadOnce VM shutdown");
             Runtime.getRuntime().addShutdownHook(shutdown);
         }
 
         static Session start(Path qemu, VmGuestImage.Build image, Path state, String phase, boolean restore, boolean minecraft) throws Exception {
+            return start(qemu, image, state, phase, restore, minecraft ? 3072 : 512, minecraft ? 2 : 1, false);
+        }
+
+        static Session startOpaque(Path qemu, VmGuestImage.Build image, Path state, String phase, boolean restore, int memory) throws Exception {
+            require(memory == 3072 || memory == 5120, "Opaque VM memory must be 3072 or 5120 MiB");
+            return start(qemu, image, state, phase, restore, memory, 2, true);
+        }
+
+        private static Session start(Path qemu, VmGuestImage.Build image, Path state, String phase, boolean restore,
+                                     int memory, int cpus, boolean opaque) throws Exception {
             Path directory = image.directory();
             Path log = LauncherFiles.tempFile(directory, phase + "-", ".log");
             Path sockets = LauncherFiles.tempDirectory(null, "loadonce-vm-sockets-");
-            Path monitor = sockets.resolve("qmp"), serial = sockets.resolve("serial");
+            Path monitor = sockets.resolve("qmp"), serial = sockets.resolve("serial"), control = sockets.resolve("control");
             List<String> command = new ArrayList<>(List.of(qemu.resolve("usr/bin/qemu-system-x86_64").toString(),
                     "-no-user-config", "-nodefaults", "-machine", "pc", "-accel", "kvm", "-cpu", "host",
-                    "-m", minecraft ? "3072" : "512", "-smp", minecraft ? "2" : "1",
+                    "-m", Integer.toString(memory), "-smp", Integer.toString(cpus),
                     "-L", qemu.resolve("usr/share/qemu").toString(), "-bios", qemu.resolve("usr/share/qemu/bios-256k.bin").toString(),
                     "-display", "none", "-vga", "none", "-nic", "none", "-no-reboot",
                     "-kernel", image.kernel().toString(), "-initrd", image.initrd().toString(),
@@ -183,12 +240,14 @@ public final class VmStateSmoke {
                     "-drive", "file=" + state + ",format=qcow2,if=virtio,id=state",
                     "-qmp", "unix:" + monitor + ",server=on,wait=off",
                     "-serial", "unix:" + serial + ",server=on,wait=off", "-rtc", "base=utc,clock=host"));
+            if (opaque) command.addAll(List.of("-serial", "unix:" + control + ",server=on,wait=off"));
             if (restore) command.addAll(List.of("-S", "-loadvm", SNAPSHOT));
             ProcessBuilder builder = new ProcessBuilder(command).directory(directory.toFile());
             builder.environment().clear(); builder.environment().putAll(environment(qemu));
             builder.redirectInput(Path.of("/dev/null").toFile());
             builder.redirectErrorStream(true); builder.redirectOutput(log.toFile());
             Process process;
+            long startedNanos = System.nanoTime();
             try { process = builder.start(); }
             catch (IOException failure) {
                 try { Files.deleteIfExists(sockets); }
@@ -197,14 +256,16 @@ public final class VmStateSmoke {
             }
             LinePipe serialPipe = null;
             LinePipe monitorPipe = null;
+            LinePipe controlPipe = null;
             Qmp qmp = null;
             try {
                 serialPipe = LinePipe.connect(serial, process, directory.resolve(phase + "-serial.log"));
                 monitorPipe = LinePipe.connect(monitor, process, directory.resolve(phase + "-qmp.log"));
+                if (opaque) controlPipe = LinePipe.connect(control, process, directory.resolve(phase + "-control.log"), true);
                 qmp = new Qmp(monitorPipe);
-                return new Session(process, serialPipe, qmp, log);
+                return new Session(process, serialPipe, controlPipe, qmp, log, startedNanos);
             } catch (Exception failure) {
-                try { cleanup(process, serialPipe, monitorPipe, sockets); }
+                try { cleanup(process, serialPipe, monitorPipe, controlPipe, sockets); }
                 catch (Exception cleanupFailure) { failure.addSuppressed(cleanupFailure); }
                 throw new IOException("VM startup failed; inspect " + log, failure);
             }
@@ -215,25 +276,25 @@ public final class VmStateSmoke {
         }
 
         @Override public void close() throws Exception {
-            try { cleanup(process, serial, qmp.pipe, serial.socket.getParent()); }
+            try { cleanup(process, serial, qmp.pipe, control, serial.socket.getParent()); }
             finally {
                 if (!process.isAlive()) Runtime.getRuntime().removeShutdownHook(shutdown);
             }
         }
 
-        private static void cleanup(Process process, LinePipe serial, LinePipe monitor, Path sockets) throws Exception {
+        private static void cleanup(Process process, LinePipe serial, LinePipe monitor, LinePipe control, Path sockets) throws Exception {
             Exception failure = null;
             process.destroyForcibly();
             try { require(process.waitFor(10, TimeUnit.SECONDS), "VM cleanup did not terminate its process"); }
             catch (Exception problem) { failure = problem; }
-            for (LinePipe pipe : new LinePipe[] { serial, monitor }) {
+            for (LinePipe pipe : new LinePipe[] { serial, monitor, control }) {
                 if (pipe == null) continue;
                 try { pipe.close(); }
                 catch (Exception problem) {
                     if (failure == null) failure = problem; else failure.addSuppressed(problem);
                 }
             }
-            for (Path file : List.of(sockets.resolve("serial"), sockets.resolve("qmp"), sockets)) {
+            for (Path file : List.of(sockets.resolve("serial"), sockets.resolve("qmp"), sockets.resolve("control"), sockets)) {
                 try { Files.deleteIfExists(file); }
                 catch (Exception problem) {
                     if (failure == null) failure = problem; else failure.addSuppressed(problem);
@@ -243,7 +304,7 @@ public final class VmStateSmoke {
         }
     }
 
-    private static final class Qmp implements AutoCloseable {
+    static final class Qmp implements AutoCloseable {
         final LinePipe pipe;
         int request;
         Qmp(LinePipe pipe) throws Exception {
@@ -269,13 +330,13 @@ public final class VmStateSmoke {
         @Override public void close() throws IOException { pipe.close(); }
     }
 
-    private static final class LinePipe implements AutoCloseable {
+    static final class LinePipe implements AutoCloseable {
         final SocketChannel channel;
         final Path socket;
         final LinkedBlockingQueue<String> lines = new LinkedBlockingQueue<>();
         final java.io.BufferedWriter output;
         final Thread reader;
-        private LinePipe(SocketChannel channel, Path socket, Path log) throws IOException {
+        private LinePipe(SocketChannel channel, Path socket, Path log, boolean control) throws IOException {
             this.channel = channel; this.socket = socket;
             Files.createFile(log, java.nio.file.attribute.PosixFilePermissions.asFileAttribute(
                     java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")));
@@ -291,11 +352,13 @@ public final class VmStateSmoke {
                             if (value == '\n') {
                                 String line = pending.toString(StandardCharsets.UTF_8).stripTrailing();
                                 pending.reset();
-                                synchronized (output) { output.write(line); output.newLine(); output.flush(); }
+                                String logged = control && (line.startsWith("OPAQUE_SCREEN ") || line.startsWith("OPAQUE_LOG "))
+                                        ? line.substring(0, line.indexOf(' ')) + " payload_characters=" + (line.length() - line.indexOf(' ') - 1) : line;
+                                synchronized (output) { output.write(logged); output.newLine(); output.flush(); }
                                 lines.put(line);
                             } else {
                                 pending.write(value);
-                                if (pending.size() > 65536) throw new IOException("VM protocol line exceeds 64 KiB");
+                                if (pending.size() > (control ? 8 * 1024 * 1024 : 65536)) throw new IOException("VM protocol line exceeds its bound");
                             }
                         }
                         bytes.clear();
@@ -307,11 +370,14 @@ public final class VmStateSmoke {
             reader.setDaemon(true); reader.start();
         }
         static LinePipe connect(Path socket, Process process, Path log) throws Exception {
+            return connect(socket, process, log, false);
+        }
+        static LinePipe connect(Path socket, Process process, Path log, boolean control) throws Exception {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             while (process.isAlive() && System.nanoTime() < deadline) {
                 if (Files.exists(socket)) {
                     SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX);
-                    try { channel.connect(UnixDomainSocketAddress.of(socket)); return new LinePipe(channel, socket, log); }
+                    try { channel.connect(UnixDomainSocketAddress.of(socket)); return new LinePipe(channel, socket, log, control); }
                     catch (IOException retry) { channel.close(); }
                 }
                 Thread.sleep(20);
