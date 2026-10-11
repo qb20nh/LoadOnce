@@ -10,8 +10,13 @@ including observed keyboard, mouse, and raw camera input, world save/reopen,
 known game sound captured through private audio, and normal exit. Fabulously
 Optimized also passed loopback Minecraft status and nonce-ping checks in an
 owned network namespace. A full second-client join and authenticated multiplayer
-remain unverified; Spectral networking was not tested. GPU warm restoration
+remain unverified; Spectral networking was not tested. Modpack GPU warm restoration
 remains blocked, so full cold-and-warm acceptance is incomplete.
+
+The [native GPU snapshot experiment](native-gpu-restoration.md) now passes GPU
+image and host-memory resource restoration in three fresh processes on the RTX.
+It is a renderer component check; Minecraft, its graphics context and its
+connections have not been restored by that experiment.
 
 End-user acceptance requires the full modpack using the real GPU, working input,
 world loading and save/reopen, game audio, and usable network connections after

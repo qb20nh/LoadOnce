@@ -1,0 +1,96 @@
+diff --git a/host/CMakeLists.txt b/host/CMakeLists.txt
+index 6b61ae5..138d137 100644
+--- a/host/CMakeLists.txt
++++ b/host/CMakeLists.txt
+@@ -18,6 +18,22 @@ if(CONFIG_AEMU)
+     add_compile_definitions(CONFIG_AEMU)
+ endif()
+ 
++option(GFXSTREAM_SNAPSHOT_FRONTEND "Build the standalone snapshot frontend" OFF)
++if(GFXSTREAM_SNAPSHOT_FRONTEND)
++    find_package(Protobuf REQUIRED)
++    add_compile_definitions(GFXSTREAM_BUILD_WITH_SNAPSHOT_SUPPORT)
++    add_compile_definitions(GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT)
++    add_library(gfxstream_snapshot_proto STATIC
++        virtio_gpu_context_snapshot.proto
++        virtio_gpu_frontend_snapshot.proto
++        virtio_gpu_resource_snapshot.proto
++        virtio_gpu_ring_blob_snapshot.proto
++        virtio_gpu_timelines_snapshot.proto)
++    protobuf_generate(TARGET gfxstream_snapshot_proto LANGUAGE cpp APPEND_PATH)
++    target_link_libraries(gfxstream_snapshot_proto PUBLIC protobuf::libprotobuf)
++    target_include_directories(gfxstream_snapshot_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
++endif()
++
+ add_compile_definitions(VK_BASE_VERSION_1_0)
+ add_compile_definitions(VK_BASE_VERSION_1_1)
+ add_compile_definitions(VK_BASE_VERSION_1_2)
+@@ -137,6 +153,9 @@ target_link_libraries(
+ if(NOT APPLE AND NOT WIN32)
+     target_link_libraries(gfxstream_backend_static PUBLIC gfxstream_xcb_headers)
+ endif()
++if(GFXSTREAM_SNAPSHOT_FRONTEND)
++    target_link_libraries(gfxstream_backend_static PUBLIC gfxstream_snapshot_proto)
++endif()
+ 
+ target_include_directories(
+         gfxstream_backend_static
+diff --git a/host/testlibs/support/GLSnapshotTestDispatch.cpp b/host/testlibs/support/GLSnapshotTestDispatch.cpp
+index 4921ee9..77db936 100644
+--- a/host/testlibs/support/GLSnapshotTestDispatch.cpp
++++ b/host/testlibs/support/GLSnapshotTestDispatch.cpp
+@@ -109,6 +109,21 @@ void SnapshotTestDispatch::testDraw(std::function<void()> doDraw) {
+     const GLESv2Dispatch* gl = LazyLoadedGLESv2Dispatch::get();
+     ASSERT_NE(nullptr, gl);
+ 
++    if (gfxstream::base::getEnvironmentVariable("ANDROID_EMU_TEST_WITH_HOST_GPU") == "1") {
++        const auto* vendor = gl->glGetString(GL_VENDOR);
++        const auto* renderer = gl->glGetString(GL_RENDERER);
++        const auto* version = gl->glGetString(GL_VERSION);
++        ASSERT_NE(vendor, nullptr);
++        ASSERT_NE(renderer, nullptr);
++        ASSERT_NE(version, nullptr);
++        const std::string rendererName(reinterpret_cast<const char*>(renderer));
++        std::fprintf(stderr, "LOADONCE_SNAPSHOT_GPU vendor=%s renderer=%s version=%s\n",
++                     reinterpret_cast<const char*>(vendor), rendererName.c_str(),
++                     reinterpret_cast<const char*>(version));
++        ASSERT_NE(rendererName.find("NVIDIA"), std::string::npos);
++        ASSERT_NE(rendererName.find("RTX 3060 Ti"), std::string::npos);
++    }
++
+     FrameBuffer* fb = FrameBuffer::getFB();
+     if (!fb) {
+         ADD_FAILURE() << "No framebuffer, test cannot snapshot.";
+diff --git a/host/testlibs/support/GLSnapshotTesting.cpp b/host/testlibs/support/GLSnapshotTesting.cpp
+index 5205091..ee11c88 100644
+--- a/host/testlibs/support/GLSnapshotTesting.cpp
++++ b/host/testlibs/support/GLSnapshotTesting.cpp
+@@ -18,6 +18,7 @@
+ #include <GLES2/gl2.h>
+ #include <GLES3/gl31.h>
+ #include <gtest/gtest.h>
++#include <cstdio>
+ 
+ #include "gfxstream/host/mem_stream.h"
+ #include "gfxstream/host/testing/GLTestUtils.h"
+@@ -228,6 +229,20 @@ testing::AssertionResult compareGlobalGlFloatv(
+ 
+ void SnapshotTest::SetUp() {
+     GLTest::SetUp();
++    if (gfxstream::base::getEnvironmentVariable("ANDROID_EMU_TEST_WITH_HOST_GPU") != "1") return;
++    ASSERT_NE(gl, nullptr);
++    const auto* vendor = gl->glGetString(GL_VENDOR);
++    const auto* renderer = gl->glGetString(GL_RENDERER);
++    const auto* version = gl->glGetString(GL_VERSION);
++    ASSERT_NE(vendor, nullptr);
++    ASSERT_NE(renderer, nullptr);
++    ASSERT_NE(version, nullptr);
++    const std::string rendererName(reinterpret_cast<const char*>(renderer));
++    std::fprintf(stderr, "LOADONCE_SNAPSHOT_GPU vendor=%s renderer=%s version=%s\n",
++                 reinterpret_cast<const char*>(vendor), rendererName.c_str(),
++                 reinterpret_cast<const char*>(version));
++    ASSERT_NE(rendererName.find("NVIDIA"), std::string::npos);
++    ASSERT_NE(rendererName.find("RTX 3060 Ti"), std::string::npos);
+ }
+ 
+ void SnapshotTest::saveSnapshot(gfxstream::Stream* stream,
